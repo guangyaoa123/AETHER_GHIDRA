@@ -1,0 +1,6 @@
+.gradle/
+build/
+dist/
+agent/.venv/
+agent/**/__pycache__/
+agent/**/*.pyc

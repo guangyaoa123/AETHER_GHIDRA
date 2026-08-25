@@ -1,0 +1,12 @@
+[project]
+name = "aether-ghidra-agent"
+version = "0.1.0"
+description = "Python agent-side runtime for the AETHER Ghidra bridge"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.27",
+    "openai>=1.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
