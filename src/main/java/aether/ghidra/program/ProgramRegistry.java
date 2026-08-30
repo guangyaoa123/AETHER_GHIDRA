@@ -1,5 +1,6 @@
 package aether.ghidra.program;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
@@ -13,17 +14,25 @@ import java.util.UUID;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
+import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
 import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileResults;
 import ghidra.app.decompiler.ClangLine;
+import ghidra.app.decompiler.ClangFuncNameToken;
 import ghidra.app.decompiler.ClangToken;
 import ghidra.app.decompiler.ClangTokenGroup;
+import ghidra.app.util.importer.ProgramLoader;
 import ghidra.app.services.ProgramManager;
+import ghidra.app.util.opinion.LoadResults;
+import ghidra.app.util.opinion.Loaded;
+import ghidra.framework.options.Options;
+import ghidra.framework.model.Project;
 import ghidra.framework.plugintool.PluginTool;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSpace;
 import ghidra.program.model.address.AddressIterator;
 import ghidra.program.model.data.DataType;
+import ghidra.program.model.data.DataTypePath;
 import ghidra.program.model.listing.CodeUnit;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.Function.FunctionUpdateType;
@@ -45,6 +54,7 @@ import ghidra.program.model.pcode.LocalSymbolMap;
 import ghidra.program.model.pcode.Varnode;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.symbol.SourceType;
+import ghidra.program.model.symbol.Namespace;
 import ghidra.program.model.symbol.Reference;
 import ghidra.program.model.symbol.ReferenceIterator;
 import ghidra.program.model.symbol.Symbol;
@@ -57,30 +67,32 @@ import aether.ghidra.observability.DebugLog;
 
 /** Owns the session-scoped identities for all Programs open in one Ghidra Tool. */
 public final class ProgramRegistry {
+	private final PluginTool tool;
 	private final ProgramManager programManager;
 	private final Object lock = new Object();
+	private final Object importLock = new Object();
 	private final Map<String, ProgramContext> byId = new LinkedHashMap<>();
 	private final IdentityHashMap<Program, String> byProgram = new IdentityHashMap<>();
 
 	public ProgramRegistry(PluginTool tool) {
-		this(tool == null ? null : tool.getService(ProgramManager.class));
+		if (tool == null) {
+			throw new IllegalStateException("PluginTool is required");
+		}
+		this.tool = tool;
+		this.programManager = tool.getService(ProgramManager.class);
+		if (programManager == null) {
+			throw new IllegalStateException("Ghidra ProgramManager service is unavailable");
+		}
 	}
 
 	/** Creates a registry for one Program, used by headless Ghidra scripts. */
 	public ProgramRegistry(Program program) {
+		this.tool = null;
 		this.programManager = null;
-		if (program == null) {
-			throw new IllegalArgumentException("Program is required");
+		if (program != null) {
+			register(program);
+			setActive(program);
 		}
-		register(program);
-		setActive(program);
-	}
-
-	private ProgramRegistry(ProgramManager programManager) {
-		if (programManager == null) {
-			throw new IllegalStateException("Ghidra ProgramManager service is unavailable");
-		}
-		this.programManager = programManager;
 	}
 
 	public void refreshOpenPrograms() {
@@ -127,6 +139,13 @@ public final class ProgramRegistry {
 		}
 	}
 
+	public Program programFor(String programId) {
+		synchronized (lock) {
+			ProgramContext context = byId.get(programId);
+			return context == null ? null : context.program();
+		}
+	}
+
 	public void setActive(Program program) {
 		synchronized (lock) {
 			for (ProgramContext context : byId.values()) {
@@ -145,6 +164,84 @@ public final class ProgramRegistry {
 		}
 	}
 
+	/** Imports one or more Programs into the interactive tool project. */
+	public Map<String, Object> importProgram(File source) {
+		if (tool == null || programManager == null) {
+			throw new BridgeException("interactive_import_unsupported",
+				"Interactive imports require a ProgramRegistry created with a PluginTool");
+		}
+		if (source == null || !source.isFile()) {
+			throw new BridgeException("invalid_argument",
+				"Import source must exist and be a regular file: " + source);
+		}
+		Project project = tool.getProject();
+		if (project == null || project.isClosed()) {
+			throw new BridgeException("project_unavailable",
+				"Interactive imports require an open Ghidra project");
+		}
+
+		synchronized (importLock) {
+			try (LoadResults<Program> loadResults = ProgramLoader.builder()
+				.source(source)
+				.project(project)
+				.load()) {
+				List<Program> loadedPrograms = new ArrayList<>();
+				try {
+					loadResults.save(TaskMonitor.DUMMY);
+					Loaded<Program> primaryLoaded = loadResults.getPrimary();
+					Program primary = primaryLoaded.getDomainObject(this);
+					loadedPrograms.add(primary);
+					for (Loaded<Program> loaded : loadResults.getNonPrimary()) {
+						loadedPrograms.add(loaded.getDomainObject(this));
+					}
+
+					for (int index = 0; index < loadedPrograms.size(); index++) {
+						Program program = loadedPrograms.get(index);
+						programManager.openProgram(program,
+							index == 0 ? ProgramManager.OPEN_CURRENT : ProgramManager.OPEN_VISIBLE);
+						register(program);
+						RttiRecoveryRunner.run(tool, program, TaskMonitor.DUMMY);
+					}
+
+					List<Map<String, Object>> programs = new ArrayList<>();
+					List<String> programIds = new ArrayList<>();
+					for (Program program : loadedPrograms) {
+						String programId = idFor(program);
+						programIds.add(programId);
+						programs.add(metadataFor(programId));
+					}
+					Map<String, Object> result = new LinkedHashMap<>();
+					result.put("primary_program_id", programIds.get(0));
+					result.put("program_ids", programIds);
+					result.put("programs", programs);
+					return result;
+				}
+				finally {
+					// ProgramManager owns opened Programs; release only this temporary consumer.
+					for (Program program : loadedPrograms) {
+						if (!program.isClosed() && program.isUsedBy(this)) {
+							program.release(this);
+						}
+					}
+				}
+			}
+			catch (BridgeException e) {
+				throw e;
+			}
+			catch (Exception e) {
+				throw new BridgeException("import_failed",
+					"Could not import " + source + ": " + e.getMessage(), e);
+			}
+		}
+	}
+
+	private Map<String, Object> metadataFor(String programId) {
+		synchronized (lock) {
+			ProgramContext context = byId.get(programId);
+			return context == null ? Map.of() : context.metadata();
+		}
+	}
+
 	public Map<String, Object> invoke(String programId, String capability, Map<String, Object> arguments)
 		throws Exception {
 		ProgramContext context;
@@ -158,13 +255,15 @@ public final class ProgramRegistry {
 
 		// A per-program monitor prevents concurrent writes to one Program while allowing
 		// requests for different open binaries to proceed independently.
-		synchronized (context) {
+			synchronized (context) {
 			return switch (capability) {
 				case "get_program_metadata" -> context.metadata();
+				case "get_analysis_status" -> getAnalysisStatus(context.program(), programId);
 				case "list_functions" -> listFunctions(context.program(), arguments);
-				case "get_function_by_name" -> getFunctionByName(context.program(), arguments);
+				case "get_function_by_name" -> throw new BridgeException("invalid_identity",
+					"Function names are discovery labels only; use a structured function address");
+				case "resolve_pseudocode_call" -> resolvePseudocodeCall(context.program(), arguments);
 				case "get_function" -> getFunction(context.program(), arguments);
-				case "get_function_pseudocode" -> getFunctionPseudocode(context.program(), arguments);
 				case "get_data_at_address" -> getDataAtAddress(context.program(), arguments);
 				case "get_xrefs_to" -> getXrefsTo(context.program(), arguments);
 				case "get_function_call_tree" -> getFunctionCallTree(context.program(), arguments);
@@ -176,10 +275,30 @@ public final class ProgramRegistry {
 				case "set_function_comment" -> setFunctionComment(context.program(), arguments);
 				case "set_code_unit_comment" -> directAnnotationOperation(context.program(), arguments, "set_code_unit_comment");
 				case "apply_annotation_batch" -> applyAnnotationBatch(context.program(), arguments);
+				case "list_struct", "get_struct", "create_struct", "add_fields", "update_fields",
+					"remove_fields", "resize_struct", "create_class", "update_class", "delete_class" ->
+					StructureManager.invoke(context.program(), capability, arguments);
 				default -> throw new BridgeException(
 					"capability_unsupported", "Unsupported capability: " + capability);
 			};
 		}
+	}
+
+	private Map<String, Object> getAnalysisStatus(Program program, String programId) {
+		boolean isAnalyzing = AutoAnalysisManager.getAnalysisManager(program).isAnalyzing();
+		Map<String, Object> result = new LinkedHashMap<>();
+		if (programId != null) {
+			result.put("program_id", programId);
+		}
+		result.put("state", isAnalyzing ? "running" : "completed");
+		result.put("is_analyzing", isAnalyzing);
+		result.put("analysis_job_id", programId == null ? null : "analysis-job-" + programId);
+		Options aetherOptions = program.getOptions("AETHER");
+		String rttiRecoveryState = aetherOptions.getString("rtti_import_recovery_state", null);
+		if (rttiRecoveryState != null && !rttiRecoveryState.isBlank()) {
+			result.put("rtti_recovery_state", rttiRecoveryState);
+		}
+		return result;
 	}
 
 	public void close() {
@@ -191,7 +310,7 @@ public final class ProgramRegistry {
 	}
 
 	private Map<String, Object> listFunctions(Program program, Map<String, Object> arguments) {
-		int limit = integerArgument(arguments, "limit", 100);
+		int limit = integerArgument(arguments, "limit", 50);
 		if (limit < 1 || limit > 1000) {
 			throw new BridgeException("invalid_argument", "limit must be between 1 and 1000");
 		}
@@ -201,6 +320,7 @@ public final class ProgramRegistry {
 			throw new BridgeException("invalid_argument", "offset must not be negative");
 		}
 		String patternText = optionalString(arguments, "pattern");
+		boolean includeCallRelationships = Boolean.TRUE.equals(arguments.get("include_call_relationships"));
 		Pattern pattern = null;
 		if (patternText != null && !patternText.isBlank()) {
 			try {
@@ -211,59 +331,138 @@ public final class ProgramRegistry {
 			}
 		}
 		List<Map<String, Object>> functions = new ArrayList<>();
+		List<Function> allFunctions = new ArrayList<>();
+		Set<Address> seenFunctions = new HashSet<>();
 		FunctionIterator iterator = program.getFunctionManager().getFunctions(true);
-		int skipped = 0;
-		while (iterator.hasNext() && functions.size() < limit) {
+		while (iterator.hasNext()) {
 			Function function = iterator.next();
+			if (seenFunctions.add(function.getEntryPoint())) {
+				allFunctions.add(function);
+			}
+		}
+		FunctionIterator externalIterator = program.getFunctionManager().getExternalFunctions();
+		while (externalIterator.hasNext()) {
+			Function function = externalIterator.next();
+			if (seenFunctions.add(function.getEntryPoint())) {
+				allFunctions.add(function);
+			}
+		}
+		int matched = 0;
+		for (Function function : allFunctions) {
 			if (nameFilter != null && !function.getName().toLowerCase().contains(nameFilter.toLowerCase())) {
 				continue;
 			}
 			if (pattern != null && !pattern.matcher(function.getName()).find()) {
 				continue;
 			}
-			if (skipped++ < offset) {
+			if (matched++ < offset || functions.size() >= limit) {
 				continue;
 			}
-			Map<String, Object> item = functionMap(function);
-			item.put("size", function.getBody().getNumAddresses());
-			item.put("library", function.isExternal() || function.getSymbol().getSource() == SourceType.DEFAULT && function.getName().startsWith("FUN_"));
-			item.put("called_functions", calleesOf(program, function).stream().map(Function::getName).toList());
-			item.put("caller_functions", callersOf(program, function).stream().map(Function::getName).toList());
+			Map<String, Object> item;
+			if (!includeCallRelationships) {
+				item = new LinkedHashMap<>();
+				item.put("address", function.getEntryPoint() == null ? null : addressMap(function.getEntryPoint()));
+				item.put("definition", function.getPrototypeString(false, false));
+			}
+			else {
+				item = functionMap(function);
+				item.put("size", function.getBody().getNumAddresses());
+				item.put("library", function.isExternal() || function.getSymbol().getSource() == SourceType.DEFAULT && function.getName().startsWith("FUN_"));
+				item.put("called_functions", calleesOf(program, function).stream().map(ProgramRegistry::functionMap).toList());
+				item.put("caller_functions", callersOf(program, function).stream().map(ProgramRegistry::functionMap).toList());
+			}
 			functions.add(item);
 		}
 		Map<String, Object> result = new LinkedHashMap<>();
 		result.put("functions", functions);
 		result.put("returned", functions.size());
-		result.put("total", Math.max(0, skipped + (iterator.hasNext() ? 1 : 0)));
+		result.put("total", matched);
 		result.put("offset", offset);
 		return result;
 	}
 
 	private Map<String, Object> getFunction(Program program, Map<String, Object> arguments) {
 		Function function = functionAt(program, arguments);
-		return functionMap(function);
-	}
-
-	private Map<String, Object> getFunctionByName(Program program, Map<String, Object> arguments) {
-		String name = Json.string(arguments, "function_name");
-		return functionMap(functionByName(program, name));
-	}
-
-	private Map<String, Object> getFunctionPseudocode(Program program, Map<String, Object> arguments) {
-		Function function;
-		if (arguments.containsKey("function_name")) {
-			function = functionByName(program, Json.string(arguments, "function_name"));
-		}
-		else {
-			function = functionAt(program, arguments);
-		}
-
-		return getFunctionPseudocode(program, function, integerArgument(arguments, "timeout_seconds", 30),
-			Boolean.TRUE.equals(arguments.get("read_only")));
+		Map<String, Object> result = functionMap(function);
+		Map<String, Object> pseudocode = getFunctionPseudocode(program, function,
+			integerArgument(arguments, "timeout_seconds", 30), Boolean.TRUE.equals(arguments.get("read_only")));
+		result.put("code", pseudocode.get("code"));
+		result.put("calls", pseudocode.get("calls"));
+		return result;
 	}
 
 	private Map<String, Object> getFunctionPseudocode(Program program, Function function, int timeout) {
 		return getFunctionPseudocode(program, function, timeout, false);
+	}
+
+	private Map<String, Object> resolvePseudocodeCall(Program program, Map<String, Object> arguments) {
+		Function caller = functionAt(program, Map.of("address", requiredArgument(arguments, "caller_address")));
+		Address callSite = locationArgument(program, Map.of("address", requiredArgument(arguments, "call_site")));
+		String displayName = optionalString(arguments, "display_name");
+		Map<String, Object> pseudocode = getFunctionPseudocode(program, caller, 30, true);
+		for (Map<String, Object> call : mapList(pseudocode.get("calls"))) {
+			if (!Json.stringify(call.get("call_site")).equals(Json.stringify(addressMap(callSite)))) {
+				continue;
+			}
+			if (displayName != null && !displayName.equals(call.get("name"))) {
+				continue;
+			}
+			Map<String, Object> result = new LinkedHashMap<>(call);
+			result.put("caller", functionMap(caller));
+			return result;
+		}
+		throw new BridgeException("not_found", "No resolved pseudocode call at " + callSite);
+	}
+
+	private static List<Map<String, Object>> pseudocodeCalls(Program program, Function caller,
+		DecompileResults results) {
+		ClangTokenGroup markup = results.getCCodeMarkup();
+		if (markup == null) {
+			return List.of();
+		}
+		List<Map<String, Object>> calls = new ArrayList<>();
+		Set<String> seen = new HashSet<>();
+		Iterator<ClangToken> tokens = markup.tokenIterator(true);
+		while (tokens.hasNext()) {
+			ClangToken token = tokens.next();
+			if (!(token instanceof ClangFuncNameToken functionToken)) {
+				continue;
+			}
+			Address callSite = functionToken.getMinAddress();
+			if (callSite == null) {
+				continue;
+			}
+			Function target = calledFunctionAt(program, callSite);
+			if (target == null) {
+				continue;
+			}
+			String key = callSite + "\n" + target.getEntryPoint();
+			if (!seen.add(key)) {
+				continue;
+			}
+			Map<String, Object> call = new LinkedHashMap<>();
+			call.put("call_site", addressMap(callSite));
+			call.put("target_address", addressMap(target.getEntryPoint()));
+			call.put("name", target.getName());
+			calls.add(call);
+		}
+		return calls;
+	}
+
+	private static Function calledFunctionAt(Program program, Address callSite) {
+		for (Reference reference : program.getReferenceManager().getReferencesFrom(callSite)) {
+			if (!reference.getReferenceType().isCall()) {
+				continue;
+			}
+			Function target = program.getFunctionManager().getFunctionAt(reference.getToAddress());
+			if (target == null) {
+				target = program.getFunctionManager().getFunctionContaining(reference.getToAddress());
+			}
+			if (target != null) {
+				return target;
+			}
+		}
+		return null;
 	}
 
 	private Map<String, Object> getFunctionPseudocode(Program program, Function function, int timeout, boolean readOnly) {
@@ -287,6 +486,7 @@ public final class ProgramRegistry {
 			response.put("function", functionMap(function));
 			response.put("signature", results.getDecompiledFunction().getSignature());
 			response.put("code", addressedPseudocode(program, function, results));
+			response.put("calls", pseudocodeCalls(program, function, results));
 			response.put("variables", decompilerVariables(function, results));
 			return response;
 		}
@@ -369,7 +569,8 @@ public final class ProgramRegistry {
 			item.put("from", addressMap(reference.getFromAddress()));
 			item.put("type", reference.getReferenceType().toString());
 			Function function = program.getFunctionManager().getFunctionContaining(reference.getFromAddress());
-			item.put("function", function == null ? nameAt(program, reference.getFromAddress()) : function.getName());
+			item.put("function", function == null ? Map.of("name", nameAt(program, reference.getFromAddress()),
+				"address", addressMap(reference.getFromAddress())) : functionMap(function));
 			references.add(item);
 		}
 		Map<String, Object> result = new LinkedHashMap<>();
@@ -500,15 +701,10 @@ public final class ProgramRegistry {
 			Map<String, Object> item = Json.object(raw);
 			Map<String, Object> lookup = new LinkedHashMap<>();
 			Object address = item.get("address");
-			if (address != null) {
-				lookup.put("address", address);
+			if (address == null) {
+				throw new BridgeException("invalid_identity", "Each function requires a structured address");
 			}
-			else if (item.get("function_name") != null) {
-				lookup.put("location", item.get("function_name"));
-			}
-			else {
-				throw new BridgeException("invalid_argument", "Each function needs an address or function_name");
-			}
+			lookup.put("address", address);
 			Function function = functionAt(program, lookup);
 			if (function.isExternal() || function.isThunk()) {
 				continue;
@@ -983,6 +1179,18 @@ public final class ProgramRegistry {
 			throw new BridgeException("invalid_argument", "data_type must not be blank");
 		}
 		try {
+			if (specification.startsWith("/")) {
+				int separator = specification.lastIndexOf('/');
+				if (separator <= 0 || separator == specification.length() - 1) {
+					throw new BridgeException("invalid_data_type", "Invalid data type path: " + specification);
+				}
+				DataType dataType = program.getDataTypeManager().getDataType(new DataTypePath(
+					specification.substring(0, separator), specification.substring(separator + 1)));
+				if (dataType == null) {
+					throw new BridgeException("invalid_data_type", "Data type not found: " + specification);
+				}
+				return dataType;
+			}
 			DataTypeParser parser = new DataTypeParser(program.getDataTypeManager(),
 				program.getDataTypeManager(), null, DataTypeParser.AllowedDataTypes.ALL);
 			return parser.parse(specification.trim());
@@ -1387,34 +1595,13 @@ public final class ProgramRegistry {
 		return function;
 	}
 
-	private static Function functionByName(Program program, String name) {
-		List<Function> matches = new ArrayList<>();
-		FunctionIterator iterator = program.getFunctionManager().getFunctions(true);
-		while (iterator.hasNext()) {
-			Function function = iterator.next();
-			if (name.equals(function.getName())) {
-				matches.add(function);
-			}
-		}
-		if (matches.size() > 1) {
-			List<String> locations = matches.stream()
-				.map(function -> function.getEntryPoint().toString())
-				.sorted()
-				.toList();
-			throw new BridgeException("ambiguous_function",
-				"Function name '" + name + "' matches multiple addresses: " + String.join(", ", locations) +
-					". Use an address-qualified reference.");
-		}
-		if (matches.size() == 1) {
-			return matches.get(0);
-		}
-		throw new BridgeException("not_found", "Function not found: " + name);
-	}
-
 	private static Map<String, Object> functionMap(Function function) {
 		Map<String, Object> result = new LinkedHashMap<>();
-		result.put("name", function.getName());
-		result.put("address", addressMap(function.getEntryPoint()));
+		Map<String, Object> reference = functionReference(function);
+		result.put("name", reference.get("name"));
+		result.put("qualified_name", reference.get("qualified_name"));
+		result.put("namespace", reference.get("namespace"));
+		result.put("address", reference.get("address"));
 		result.put("signature", function.getPrototypeString(false, false));
 		result.put("comment", function.getComment() == null ? "" : function.getComment());
 		result.put("external", function.isExternal());
@@ -1425,9 +1612,22 @@ public final class ProgramRegistry {
 		return result;
 	}
 
+	private static Map<String, Object> functionReference(Function function) {
+		Map<String, Object> result = new LinkedHashMap<>();
+		Namespace parent = function.getParentNamespace();
+		String namespace = parent == null || parent.isGlobal() ? null : parent.getName(true);
+		String name = function.getName();
+		result.put("address", addressMap(function.getEntryPoint()));
+		result.put("name", name);
+		result.put("qualified_name", namespace == null || namespace.isBlank() ? name : namespace + "::" + name);
+		result.put("namespace", namespace);
+		return result;
+	}
+
 	private static Map<String, Object> functionDefinitionMap(Function function) {
 		Map<String, Object> result = new LinkedHashMap<>();
 		result.put("return_type", function.getReturnType().getDisplayName());
+		result.put("return_type_path", function.getReturnType().getPathName());
 		result.put("calling_convention", function.getCallingConventionName());
 		result.put("varargs", function.hasVarArgs());
 		result.put("custom_storage", function.hasCustomVariableStorage());
@@ -1436,6 +1636,7 @@ public final class ProgramRegistry {
 			Map<String, Object> item = new LinkedHashMap<>();
 			item.put("name", parameter.getName());
 			item.put("data_type", parameter.getDataType().getDisplayName());
+			item.put("data_type_path", parameter.getDataType().getPathName());
 			item.put("ordinal", parameter.getOrdinal());
 			item.put("auto_parameter", parameter.isAutoParameter());
 			VariableStorage storage = parameter.getVariableStorage();
@@ -1454,26 +1655,8 @@ public final class ProgramRegistry {
 		if (raw == null) {
 			raw = arguments.get("location");
 		}
-		if (raw instanceof String value) {
-			try {
-				Address parsed = program.getAddressFactory().getAddress(value);
-				if (parsed != null) {
-					return parsed;
-				}
-			}
-			catch (RuntimeException ignored) {
-				// Try a function name below.
-			}
-			try {
-				return program.getAddressFactory().getDefaultAddressSpace().getAddress(parseOffset(value));
-			}
-			catch (RuntimeException ignored) {
-				Address symbolAddress = symbolAddress(program, value);
-				if (symbolAddress != null) {
-					return symbolAddress;
-				}
-				return functionByName(program, value).getEntryPoint();
-			}
+		if (!(raw instanceof Map<?, ?>)) {
+			throw new BridgeException("invalid_identity", "An address-qualified reference is required");
 		}
 		Map<String, Object> address = Json.object(raw);
 		String offsetValue = Json.string(address, "offset");
@@ -1493,36 +1676,12 @@ public final class ProgramRegistry {
 		}
 	}
 
-	private static Address symbolAddress(Program program, String name) {
-		List<Symbol> matches = new ArrayList<>();
-		SymbolIterator exactIterator = program.getSymbolTable().getSymbols(name);
-		while (exactIterator.hasNext()) {
-			matches.add(exactIterator.next());
+	private static Object requiredArgument(Map<String, Object> arguments, String key) {
+		Object value = arguments.get(key);
+		if (value == null) {
+			throw new BridgeException("invalid_identity", key + " is required");
 		}
-		if (matches.isEmpty()) {
-			SymbolIterator iterator = program.getSymbolTable().getSymbolIterator();
-			while (iterator.hasNext()) {
-				Symbol symbol = iterator.next();
-				if (name.equals(symbol.getName(true))) {
-					matches.add(symbol);
-				}
-			}
-		}
-		if (matches.isEmpty()) {
-			return null;
-		}
-
-		Set<Address> addresses = new HashSet<>();
-		for (Symbol symbol : matches) {
-			addresses.add(symbol.getAddress());
-		}
-		if (addresses.size() > 1) {
-			List<String> locations = addresses.stream().map(Address::toString).sorted().toList();
-			throw new BridgeException("ambiguous_symbol",
-				"Symbol name '" + name + "' matches multiple addresses: " + String.join(", ", locations) +
-					". Use an address-qualified reference.");
-		}
-		return addresses.iterator().next();
+		return value;
 	}
 
 	private static String nameAt(Program program, Address address) {
@@ -1596,6 +1755,28 @@ public final class ProgramRegistry {
 		result.put("space", address.getAddressSpace().getName());
 		result.put("offset", Long.toUnsignedString(address.getOffset(), 16));
 		return result;
+	}
+
+	private static List<Map<String, Object>> mapList(Object value) {
+		if (!(value instanceof List<?> list)) {
+			return List.of();
+		}
+		List<Map<String, Object>> result = new ArrayList<>();
+		for (Object item : list) {
+			if (item instanceof Map<?, ?> map) {
+				result.add(Json.object(map));
+			}
+		}
+		return result;
+	}
+
+	private static String qualifiedFunctionName(Function function) {
+		Namespace parent = function.getParentNamespace();
+		if (parent == null || parent.isGlobal()) {
+			return function.getName();
+		}
+		String namespace = parent.getName(true);
+		return namespace == null || namespace.isBlank() ? function.getName() : namespace + "::" + function.getName();
 	}
 
 	private static int integerArgument(Map<String, Object> arguments, String key, int defaultValue) {

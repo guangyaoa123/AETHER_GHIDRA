@@ -124,7 +124,6 @@ public final class AetherConfigDialog extends DialogComponentProvider {
 		JPanel groupsPanel = new JPanel(new GridLayout(0, 1));
 		groupsPanel.setBorder(BorderFactory.createTitledBorder("Chatbot tool groups"));
 		addToolGroup(groupsPanel, configuredGroups, "program_read", "Program inspection (read-only)");
-		addToolGroup(groupsPanel, configuredGroups, "analysis_context", "Analysis context");
 		addToolGroup(groupsPanel, configuredGroups, "program_write", "Program mutation (renames/comments)");
 		addToolGroup(groupsPanel, configuredGroups, "planning", "Planning");
 		addToolGroup(groupsPanel, configuredGroups, "memory", "Memory");

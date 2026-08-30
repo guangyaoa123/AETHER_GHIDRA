@@ -5,9 +5,11 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from ..integrations.ghidra.bridge_client import BridgeClient
+from ..integrations.ghidra.gateway import AnalysisBackend, GhidraAnalysisBackend, ProgramGateway
+from ..integrations.ghidra.identity import normalize_bridge_arguments
 from ..features.chat.agent import ChatbotAgent
 from ..engine import AgentCancelled
 from ..features.annotation.workflow import AnnotationCancelled, AnnotationWorkflow
@@ -70,10 +72,17 @@ class IndexJob:
 
 
 class AgentRuntime:
-    """Own one persistent legacy-compatible chatbot session per Ghidra Program."""
+    """Own one persistent chatbot session per Program gateway."""
 
-    def __init__(self, bridge: BridgeClient | None = None) -> None:
-        self.bridge = bridge or BridgeClient()
+    def __init__(
+        self,
+        bridge: BridgeClient | None = None,
+        *,
+        backend: AnalysisBackend | None = None,
+        gateway_factory: Callable[[str], ProgramGateway] | None = None,
+    ) -> None:
+        self.backend = backend or GhidraAnalysisBackend(bridge)
+        self._gateway_factory = gateway_factory or self.backend.gateway_for
         self._sessions: dict[str, ProgramSession] = {}
         self._lock = threading.RLock()
         self._annotation_jobs: dict[str, AnnotationJob] = {}
@@ -81,7 +90,7 @@ class AgentRuntime:
         self._index_jobs: dict[str, IndexJob] = {}
 
     def programs(self) -> list[dict[str, Any]]:
-        programs = self.bridge.list_programs()
+        programs = self.backend.list_programs()
         live_ids = {str(program["program_id"]) for program in programs}
         with self._lock:
             for program_id in set(self._sessions) - live_ids:
@@ -94,14 +103,16 @@ class AgentRuntime:
             if existing is not None:
                 return existing
             logger.info("creating chatbot session program_id=%s", program_id)
-            session = ProgramSession(program_id, ChatbotAgent(program_id, self.bridge_for(program_id)))
+            session = ProgramSession(program_id, ChatbotAgent(program_id, self.gateway_for(program_id)))
             self._sessions[program_id] = session
             return session
 
-    def bridge_for(self, program_id: str):
-        from ..integrations.ghidra.chatbot_backend import GhidraChatbotBackendBridge
+    def gateway_for(self, program_id: str) -> ProgramGateway:
+        return self._gateway_factory(program_id)
 
-        return GhidraChatbotBackendBridge(program_id, self.bridge)
+    def bridge_for(self, program_id: str) -> ProgramGateway:
+        """Compatibility alias for integrations that still use the old name."""
+        return self.gateway_for(program_id)
 
     def run_capability(
         self,
@@ -112,7 +123,9 @@ class AgentRuntime:
         logger.debug("capability start program_id=%s capability=%s", program_id, capability)
         if not capability_enabled(capability, CAPABILITY_TO_TOOL, TOOL_GROUP_BY_NAME):
             raise ToolPolicyError(f"Capability disabled by tool policy: {capability}")
-        result = self.bridge.invoke(program_id, capability, arguments)
+        result = self.gateway_for(program_id).invoke(
+            program_id, capability, normalize_bridge_arguments(capability, arguments)
+        )
         logger.debug("capability complete program_id=%s capability=%s", program_id, capability)
         return result
 
@@ -185,7 +198,7 @@ class AgentRuntime:
     def _run_index(self, job: IndexJob, resume: bool, reindex: bool) -> None:
         job.state = "running"
         try:
-            bridge = self.bridge_for(job.program_id)
+            bridge = self.gateway_for(job.program_id)
             index = FunctionIndexer(
                 job.program_id,
                 bridge,
@@ -193,14 +206,36 @@ class AgentRuntime:
                 progress=lambda update: self._update_index_progress(job, update),
             ).run(resume=resume, reindex=reindex)
             job.result = index.to_dict()
+            job.progress = {
+                "phase": index.batch_metadata.phase,
+                "state": index.indexing_state,
+                "progress": index.indexing_progress,
+                "percent": index.indexing_progress,
+                "indexed": index.size(),
+                "total": index.total_function_count,
+                "current": index.batch_metadata.current_function_name,
+                "message": index.batch_metadata.last_error or "",
+            }
             job.state = "completed"
         except IndexCancelled as error:
             job.state = "cancelled"
             job.error = str(error)
+            job.progress = {
+                **job.progress,
+                "state": "cancelled",
+                "phase": "CANCELLED",
+                "message": str(error),
+            }
         except Exception as error:
             logger.exception("index job failed job_id=%s", job.job_id)
             job.state = "failed"
             job.error = str(error)
+            job.progress = {
+                **job.progress,
+                "state": "failed",
+                "phase": "FAILED",
+                "message": str(error),
+            }
 
     @staticmethod
     def _update_index_progress(job: IndexJob, update: dict[str, Any]) -> None:
@@ -228,7 +263,7 @@ class AgentRuntime:
         return self.index_job(job_id)
 
     def index_stats(self, program_id: str) -> dict[str, Any]:
-        metadata = self.bridge_for(program_id).get_program_metadata()
+        metadata = self.gateway_for(program_id).get_program_metadata()
         index = FunctionIndexManager.get(metadata)
         importance: dict[str, int] = {}
         categories: dict[str, int] = {}
@@ -243,7 +278,7 @@ class AgentRuntime:
     def index_entries(self, program_id: str, offset: int = 0, limit: int = 1000) -> dict[str, Any]:
         if offset < 0 or limit < 1 or limit > 5000:
             raise ValueError("index entries offset must be non-negative and limit must be between 1 and 5000")
-        metadata = self.bridge_for(program_id).get_program_metadata()
+        metadata = self.gateway_for(program_id).get_program_metadata()
         index = FunctionIndexManager.get(metadata)
         entries = list(index.entries_by_address.values())
         page = entries[offset:offset + limit]
@@ -260,7 +295,7 @@ class AgentRuntime:
         }
 
     def search_index(self, program_id: str, query: str) -> str:
-        metadata = self.bridge_for(program_id).get_program_metadata()
+        metadata = self.gateway_for(program_id).get_program_metadata()
         return search_index(FunctionIndexManager.get(metadata), query)
 
     def start_chat(self, program_id: str, message: str, address: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -349,7 +384,7 @@ class AgentRuntime:
         logger.info("annotation job start job_id=%s program_id=%s mode=%s", job.job_id, job.program_id, request.get("mode", "manual"))
         try:
             workflow = AnnotationWorkflow(
-                self.bridge_for(job.program_id), job.program_id, job.cancel,
+                self.gateway_for(job.program_id), job.program_id, job.cancel,
                 lambda message, progress: self._update_annotation(job, message, progress),
             )
             job.result = workflow.run(request)
@@ -378,7 +413,14 @@ class AgentRuntime:
         with self._lock:
             job = self._annotation_jobs.get(job_id)
         if job is None:
-            raise KeyError(f"Unknown annotation job: {job_id}")
+            logger.warning("annotation job missing job_id=%s; treating it as lost after an agent restart", job_id)
+            return {
+                "job_id": job_id,
+                "state": "lost",
+                "progress": 0,
+                "message": "Annotation job is no longer available; the Python agent was restarted.",
+                "error": "Annotation job lost because the Python agent restarted.",
+            }
         result: dict[str, Any] = {
             "job_id": job.job_id, "program_id": job.program_id, "state": job.state,
             "progress": job.progress, "message": job.message,
@@ -393,9 +435,9 @@ class AgentRuntime:
         with self._lock:
             job = self._annotation_jobs.get(job_id)
         if job is None:
-            raise KeyError(f"Unknown annotation job: {job_id}")
+            return self.annotation_job(job_id)
         job.cancel.set()
         return self.annotation_job(job_id)
 
     def undo_annotation(self, program_id: str) -> dict[str, Any]:
-        return AnnotationWorkflow(self.bridge_for(program_id), program_id).undo_last()
+        return AnnotationWorkflow(self.gateway_for(program_id), program_id).undo_last()

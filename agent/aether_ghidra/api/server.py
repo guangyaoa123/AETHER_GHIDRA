@@ -14,7 +14,7 @@ from ..application.runtime import AgentRuntime, ToolPolicyError
 
 
 logger = logging.getLogger(__name__)
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 
 class AgentHandler(BaseHTTPRequestHandler):

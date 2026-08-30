@@ -13,6 +13,8 @@ from aether_ghidra.tools.catalog import ChatbotToolbox
 
 ROOT = {"space": "ram", "offset": "1000"}
 CALLEE = {"space": "ram", "offset": "1100"}
+ENTRY_REF = {"address": ROOT, "name": "entry"}
+DECODE_REF = {"address": CALLEE, "name": "decode"}
 
 
 class FakeAnnotationBridge:
@@ -62,7 +64,7 @@ class FakeToolClient:
                 "type": "function",
                 "function": {
                     "name": "rename_function",
-                    "arguments": '{"function_name":"decode","name":"decode_payload"}',
+                    "arguments": '{"function_ref":{"address":{"space":"ram","offset":"1100"},"name":"decode"},"name":"decode_payload"}',
                 },
             }]),
             FakeToolMessage(tool_calls=[{
@@ -70,7 +72,7 @@ class FakeToolClient:
                 "type": "function",
                 "function": {
                     "name": "set_function_comment",
-                    "arguments": '{"function_name":"decode","comment":"Decodes the payload."}',
+                    "arguments": '{"function_ref":{"address":{"space":"ram","offset":"1100"},"name":"decode"},"comment":"Decodes the payload."}',
                 },
             }]),
             FakeToolMessage("Annotation complete."),
@@ -118,7 +120,7 @@ class AnnotationWorkflowTests(unittest.TestCase):
         bridge = FakeAnnotationBridge()
         workflow = AnnotationWorkflow(bridge, "program-1")
         selected = workflow._selected_functions(
-            {"selected_functions": ["decode", "not-a-candidate"]},
+            {"selected_functions": [DECODE_REF, {"name": "not-a-candidate"}]},
             [{"name": "entry", "address": ROOT}, {"name": "decode", "address": CALLEE}],
             "manual",
         )
@@ -306,7 +308,7 @@ class AnnotationWorkflowTests(unittest.TestCase):
                 "type": "function",
                 "function": {
                     "name": "rename_variable",
-                    "arguments": '{"function_name":"entry","variable_name":"this","name":"context"}',
+                    "arguments": '{"function_ref":{"address":{"space":"ram","offset":"1000"},"name":"entry"},"variable_name":"this","name":"context"}',
                 },
             }]),
             FakeToolMessage(tool_calls=[{
@@ -314,7 +316,7 @@ class AnnotationWorkflowTests(unittest.TestCase):
                 "type": "function",
                 "function": {
                     "name": "set_function_comment",
-                    "arguments": '{"function_name":"entry","comment":"Valid comment."}',
+                    "arguments": '{"function_ref":{"address":{"space":"ram","offset":"1000"},"name":"entry"},"comment":"Valid comment."}',
                 },
             }]),
             FakeToolMessage("Annotation complete."),
@@ -359,7 +361,7 @@ class AnnotationWorkflowTests(unittest.TestCase):
 
         self.assertIn('"function_sketches"', captured["prompt"])
         self.assertIn('"decrypt();"', captured["prompt"])
-        self.assertNotIn('"pseudocode": "void decode()', captured["prompt"])
+        self.assertIn('"function_ref"', captured["prompt"])
         self.assertNotIn("Existing decode comment", captured["prompt"])
         self.assertEqual([item["name"] for item in selected], ["entry", "decode"])
 
@@ -372,7 +374,7 @@ class AnnotationWorkflowTests(unittest.TestCase):
         }]})
 
         self.assertEqual(sketches, [{
-            "address": CALLEE,
+            "function_ref": {"address": CALLEE, "name": "decode"},
             "pseudocode_sketch": ["decrypt();", "return;"],
         }])
 
@@ -414,6 +416,7 @@ class AnnotationWorkflowTests(unittest.TestCase):
         prompt = call.call_args.args[1]
         self.assertIn("Focus on decoding logic.", prompt)
         self.assertIn("0x1100: void decode() {}", prompt)
+        self.assertIn('"function_ref"', prompt)
         self.assertNotIn("Renameable variable targets:", prompt)
         self.assertNotIn('"mode"', prompt)
         self.assertNotIn('"instruction"', prompt)

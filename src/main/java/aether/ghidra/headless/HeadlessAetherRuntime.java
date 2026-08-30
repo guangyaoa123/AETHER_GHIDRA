@@ -6,7 +6,7 @@ import aether.ghidra.bridge.BridgeServer;
 import aether.ghidra.plugin.AgentProcess;
 import aether.ghidra.program.ProgramRegistry;
 
-/** Shared AETHER bridge and agent lifecycle for one headless Ghidra Program. */
+/** Shared AETHER bridge and agent lifecycle for a headless Ghidra workspace. */
 public final class HeadlessAetherRuntime implements AutoCloseable {
 	private final ProgramRegistry registry;
 	private final BridgeServer bridge;

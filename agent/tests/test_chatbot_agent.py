@@ -9,17 +9,15 @@ from aether_ghidra.features.chat.agent import ChatbotAgent
 
 
 class FakeBridge:
-    def resolve_function(self, function_name: str):
-        return {"name": function_name, "address": {"space": "ram", "offset": "1000"}}
-
-    def get_function_name(self, function_ref):
-        return function_ref["name"]
+    def resolve_function(self, function_ref):
+        return {"name": function_ref.get("name", "entry"), "address": function_ref["address"]}
 
     def list_functions(self, pattern: str = "", limit: int = 500):
         return [{"name": "entry", "address": {"space": "ram", "offset": "1000"}}]
 
-    def get_function_pseudocode(self, function_name: str):
-        return f"void {function_name}(void) {{}}"
+    def get_function(self, function_ref):
+        return {"address": function_ref["address"], "name": function_ref.get("name", "function"),
+                "code": f"void {function_ref.get('name', 'function')}(void) {{}}"}
 
     def get_data_at_address(self, location: str, count: int = 16):
         return {"ea": location, "bytes": "90"}
@@ -27,11 +25,11 @@ class FakeBridge:
     def get_xrefs_to(self, location: str):
         return {"total": 0, "references": []}
 
-    def rename_function(self, function_name: str, name: str):
-        return f"Renamed '{function_name}' to '{name}'."
+    def rename_function(self, function_ref, name: str):
+        return f"Renamed '{function_ref.get('name', 'function')}' to '{name}'."
 
-    def set_function_comment(self, function_name: str, comment: str):
-        return f"Updated comment for '{function_name}'."
+    def set_function_comment(self, function_ref, comment: str):
+        return f"Updated comment for '{function_ref.get('name', 'function')}'."
 
 
 class FakeMessage:

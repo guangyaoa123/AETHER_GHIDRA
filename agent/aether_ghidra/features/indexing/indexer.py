@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import threading
 from typing import Any, Callable
 
 from ...config.settings import load_config
 from ...integrations.ghidra.chatbot_backend import GhidraChatbotBackendBridge
+from ...integrations.ghidra.identity import function_ref
 from .manager import FunctionIndexManager
 from .model import BatchMetadata, FunctionEntry, FunctionIndex
 from .taxonomy import DEFAULT_FUNCTION_TAGS, DynamicTagManager, IMPORTANCE_LEVELS, normalize_tag
@@ -74,7 +76,7 @@ class FunctionIndexer:
         offset = 0
         while True:
             self._check()
-            page = self.bridge.list_functions(limit=1000, offset=offset)
+            page = self.bridge.list_functions(limit=1000, offset=offset, include_call_relationships=True)
             items = list(page.get("functions", []))
             functions.extend(items)
             if len(items) < 1000:
@@ -97,11 +99,32 @@ class FunctionIndexer:
         size = int(item.get("size", 0) or 0)
         if size <= 0 or (self.max_decompile_size > 0 and size > self.max_decompile_size):
             return None
-        result = self.bridge.get_function_pseudocode(item["address"], read_only=True)
+        result = self.bridge.get_function(function_ref({
+            "address": item["address"], "name": item.get("name", ""),
+        }), read_only=True)
         return str(result.get("code", "")) or None
 
     @staticmethod
     def _tools() -> list[dict[str, Any]]:
+        address_schema = {
+            "type": "object",
+            "properties": {"space": {"type": "string"}, "offset": {"type": "string"}},
+            "required": ["space", "offset"],
+            "additionalProperties": False,
+        }
+        function_ref_schema = {
+            "type": "object",
+            "properties": {
+                "address": address_schema, "name": {"type": "string"}, "signature": {"type": "string"},
+                "namespace": {"type": "string"}, "comment": {"type": "string"},
+                "external": {"type": "boolean"}, "thunk": {"type": "boolean"},
+                "default_name": {"type": "boolean"}, "return_type": {"type": "string"},
+                "calling_convention": {"type": "string"}, "varargs": {"type": "boolean"},
+                "custom_storage": {"type": "boolean"}, "parameters": {"type": "array"},
+            },
+            "required": ["address"],
+            "additionalProperties": True,
+        }
         return [{
             "type": "function",
             "function": {
@@ -110,15 +133,14 @@ class FunctionIndexer:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "name": {"type": "string"},
-                        "address": {"type": "string"},
+                        "function_ref": function_ref_schema,
                         "importance": {"type": "string", "enum": list(IMPORTANCE_LEVELS)},
                         "categories": {"type": "array", "items": {"type": "string"}, "minItems": 1},
                         "summary": {"type": "string"},
                         "key_operations": {"type": "array", "items": {"type": "string"}},
                         "key_constants": {"type": "array", "items": {"type": "string"}},
                     },
-                    "required": ["name", "address", "importance", "categories", "summary"],
+                    "required": ["function_ref", "importance", "categories", "summary"],
                 },
             },
         }]
@@ -135,26 +157,49 @@ class FunctionIndexer:
             http_client=httpx.Client(verify=False, timeout=600.0),
         )
 
+    def _cancellable_request(self, request: Callable[[], Any]) -> Any:
+        """Keep cancellation responsive while a provider request is blocked."""
+        result: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+        def invoke() -> None:
+            try:
+                result.put((True, request()))
+            except BaseException as error:  # Re-raise provider failures in the worker.
+                result.put((False, error))
+
+        threading.Thread(target=invoke, name="aether-index-provider", daemon=True).start()
+        while True:
+            try:
+                succeeded, value = result.get(timeout=0.1)
+            except queue.Empty:
+                self._check()
+                continue
+            if succeeded:
+                return value
+            raise value
+
     def _classify(self, batch: list[dict[str, Any]], pseudocode: dict[str, str], index: FunctionIndex, tags: DynamicTagManager) -> list[FunctionEntry]:
         tag_lines = "\n".join(f"- {key}: {value}" for key, value in DEFAULT_FUNCTION_TAGS.items())
         sections = []
         for item in batch:
             address = address_key(item["address"])
-            sections.append(f"## {item.get('name', '')} [{address}]\n```c\n{pseudocode.get(address, '')}\n```")
+            reference = function_ref(item)
+            sections.append(f"## function_ref={json.dumps(reference, default=str)}\n```c\n{pseudocode.get(address, '')}\n```")
         prompt = f"""You are an expert reverse engineer classifying functions in batch indexing.
 Assign exactly one importance level and one or more functional categories.
 Importance: CRITICAL, HIGH, MEDIUM, LOW, MINIMAL.
 Categories:\n{tag_lines}
-Return only one index_function_entry tool call per function shown. Summaries must be searchable and explain what, how, and context.
+Return only one index_function_entry tool call per function shown. Copy the exact structured function_ref for that function; never identify a function by name alone. Summaries must be searchable and explain what, how, and context.
 Functions:\n{chr(10).join(sections)}"""
-        response = self._client().chat.completions.create(
+        client = self._client()
+        response = self._cancellable_request(lambda: client.chat.completions.create(
             model=self.config.get("INDEXING_MODEL") or self.config.get("OPENAI_MODEL", "qwen/qwen3-coder"),
             messages=[{"role": "user", "content": prompt}],
             tools=self._tools(),
             tool_choice="required",
             temperature=0.7,
             max_tokens=int(self.config.get("INDEXING_MAX_TOKENS", 65_536)),
-        )
+        ))
         message = response.choices[0].message
         entries: list[FunctionEntry] = []
         valid_addresses = {address_key(item["address"]): item for item in batch}
@@ -162,11 +207,6 @@ Functions:\n{chr(10).join(sections)}"""
             alias: canonical
             for canonical, item in valid_addresses.items()
             for alias in address_aliases(canonical)
-        }
-        names_to_address = {
-            str(item.get("name", "")).strip().lower(): canonical
-            for canonical, item in valid_addresses.items()
-            if str(item.get("name", "")).strip()
         }
         tool_calls = getattr(message, "tool_calls", None) or []
         logger.info("index classification response tool_calls=%d batch=%d", len(tool_calls), len(batch))
@@ -186,13 +226,18 @@ Functions:\n{chr(10).join(sections)}"""
                 continue
             if not isinstance(args, dict):
                 continue
-            address_value = args.get("address", "")
+            raw_ref = args.get("function_ref")
+            if not isinstance(raw_ref, dict):
+                logger.warning("index classification returned no structured function_ref")
+                continue
+            address_value = raw_ref.get("address")
+            if not isinstance(address_value, dict):
+                logger.warning("index classification returned a non-structured function address")
+                continue
             address = next((aliases_to_address[alias] for alias in address_aliases(address_value) if alias in aliases_to_address), None)
-            name = str(args.get("name") or "").strip()
-            if address is None and name:
-                address = names_to_address.get(name.lower())
+            name = str(raw_ref.get("name") or "").strip()
             if address is None:
-                logger.warning("index classification returned unknown function address=%r name=%r", address_value, name)
+                logger.warning("index classification returned unknown function_ref=%r", raw_ref)
                 continue
             name = name or str(valid_addresses[address].get("name", ""))
             importance = str(args.get("importance", "")).upper()
@@ -227,16 +272,17 @@ Functions:\n{chr(10).join(sections)}"""
     def _resolve_unknowns(self, entries: list[FunctionEntry], tags: DynamicTagManager) -> int:
         if not entries:
             return 0
-        prompt = "Classify the following reverse engineering index entries. Replace unknown with one to three specific functional categories. Return only resolve_unknown_entry tool calls.\n"
+        prompt = "Classify the following reverse engineering index entries. Replace unknown with one to three specific functional categories. Copy the exact structured function_ref; never resolve an entry by name. Return only resolve_unknown_entry tool calls.\n"
         for entry in entries:
-            prompt += f"- {entry.name} [{entry.address}] tags={sorted(entry.tags)} summary={entry.summary}\n"
-        tool = {"type": "function", "function": {"name": "resolve_unknown_entry", "description": "Resolve unknown categories.", "parameters": {"type": "object", "properties": {"address": {"type": "string"}, "categories": {"type": "array", "items": {"type": "string"}}}, "required": ["address", "categories"]}}}
-        response = self._client().chat.completions.create(
+            prompt += f"- {json.dumps({'address': {'space': entry.address.split(':', 1)[0], 'offset': entry.address.split(':', 1)[-1]}, 'name': entry.name})} tags={sorted(entry.tags)} summary={entry.summary}\n"
+        tool = {"type": "function", "function": {"name": "resolve_unknown_entry", "description": "Resolve unknown categories.", "parameters": {"type": "object", "properties": {"function_ref": {"type": "object", "properties": {"address": {"type": "object", "properties": {"space": {"type": "string"}, "offset": {"type": "string"}}, "required": ["space", "offset"]}, "name": {"type": "string"}}, "required": ["address"]}, "categories": {"type": "array", "items": {"type": "string"}}}, "required": ["function_ref", "categories"]}}}
+        client = self._client()
+        response = self._cancellable_request(lambda: client.chat.completions.create(
             model=self.config.get("INDEXING_MODEL") or self.config.get("OPENAI_MODEL", "qwen/qwen3-coder"),
             messages=[{"role": "user", "content": prompt}],
             tools=[tool], tool_choice="required", temperature=0.3,
             max_tokens=int(self.config.get("INDEXING_MAX_TOKENS", 65_536)),
-        )
+        ))
         by_address = {entry.address: entry for entry in entries}
         updated = 0
         for call in getattr(response.choices[0].message, "tool_calls", None) or []:
@@ -244,10 +290,13 @@ Functions:\n{chr(10).join(sections)}"""
             if function is None:
                 continue
             try:
-                args = json.loads(function.arguments)
+                args = function.arguments if isinstance(function.arguments, dict) else json.loads(function.arguments)
             except (TypeError, json.JSONDecodeError):
                 continue
-            address = address_key(args.get("address"))
+            raw_ref = args.get("function_ref")
+            if not isinstance(raw_ref, dict):
+                continue
+            address = address_key(raw_ref.get("address"))
             entry = by_address.get(address)
             categories = {tags.resolve(value, entry.name) for value in args.get("categories", [])} if entry else set()
             if entry and categories:
@@ -263,6 +312,8 @@ Functions:\n{chr(10).join(sections)}"""
         index.indexing_state = "IN_PROGRESS"
         index.indexed = False
         index.total_function_count = max(index.total_function_count, int(metadata.get("function_count", 0)))
+        index.batch_metadata.last_error = None
+        index.batch_metadata.indexed_functions = index.size()
         index.batch_metadata.start_time = index.batch_metadata.start_time or int(__import__("time").time() * 1000)
         FunctionIndexManager.save(index)
         self._update(index, "COLLECTING_FUNCTIONS")
@@ -281,7 +332,11 @@ Functions:\n{chr(10).join(sections)}"""
             index.indexed = True
             index.indexing_state = "COMPLETED"
             index.indexing_progress = 100
+            index.batch_metadata.indexed_functions = index.size()
+            index.batch_metadata.phase = "COMPLETED"
+            index.batch_metadata.last_error = None
             FunctionIndexManager.save(index)
+            self._update(index, "COMPLETED")
             return index
 
         pseudocode: dict[str, str] = {}
@@ -371,9 +426,12 @@ Functions:\n{chr(10).join(sections)}"""
         index.indexed = bool(index.entries_by_address) and not remaining_failures
         index.indexing_state = "COMPLETED" if index.indexed else "PARTIAL"
         index.indexing_progress = 100
+        index.batch_metadata.indexed_functions = index.size()
         index.batch_metadata.phase = index.indexing_state
         if remaining_failures:
             index.batch_metadata.last_error = f"{len(remaining_failures)} functions were not classified"
+        else:
+            index.batch_metadata.last_error = None
         FunctionIndexManager.save(index)
         self._update(index, index.batch_metadata.phase)
         return index

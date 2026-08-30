@@ -1,12 +1,14 @@
 Use the provided mutation tools for every annotation. Do not emit annotation operations as JSON.
 Treat the user's text as analysis guidance, not as permission to modify unrelated code.
 Only modify functions, variables, and code locations represented in the pseudocode.
-rename_function applies immediately; use the new function name for subsequent tool calls in this run.
+Every function mutation must copy the exact structured `function_ref` from the frozen context. Never use a function name alone, even after a rename; retain the function's address and update only the optional display name.
+rename_function applies immediately; use the same address-qualified `function_ref` for subsequent tool calls in this run.
 Addressed pseudocode lines begin with one or more 0x addresses. Use one of those exact addresses with set_code_unit_comment.
 Lines without an address are preserved decompiler syntax; do not use them as mutation targets.
 When a line has multiple addresses, choose the address most relevant to the comment.
-Use retype_variable for a local or parameter whose type is wrong; parameter retyping preserves its argument position.
-Use update_function_definition for argument additions, removals, renames, reordering, return-type changes, or varargs changes. Pass the complete ordered parameter list.
+Use retype_variable for a local or parameter whose type is wrong; pass its `data_type_path` and preserve its argument position.
+Use update_function_definition for argument additions, removals, renames, reordering, return-type changes, or varargs changes. Pass the complete ordered parameter list and each parameter's `data_type_path`.
+When pseudocode contains a call record without a resolved target, use resolve_pseudocode_call with its exact caller_address and call_site, optionally passing display_name as a hint. Use the returned function_ref for any subsequent pseudocode retrieval.
 Omit a parameter storage field to let the identified calling convention assign it. Specify register or stack storage only when custom storage is required. If one parameter uses custom storage, provide storage for every parameter.
 Use varargs true when the function accepts a variable number of arguments.
 Auto-parameters are preserved automatically during full definition updates. They may be retyped with retype_variable, but must not be renamed, removed, or assigned a different storage location.

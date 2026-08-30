@@ -9,7 +9,6 @@ TOOL_CONFIG_PATH = Path.home() / ".config" / "aether-ghidra" / "chatbot-tool-con
 TOOL_CONFIG_VERSION = 2
 DEFAULT_GROUPS: dict[str, bool] = {
     "program_read": True,
-    "analysis_context": True,
     "program_write": False,
     "planning": True,
     "memory": True,

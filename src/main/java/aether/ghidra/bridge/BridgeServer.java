@@ -21,7 +21,7 @@ import aether.ghidra.program.ProgramRegistry;
 /** Localhost-only HTTP bridge used by the Python agent service. */
 public final class BridgeServer {
 	private static final int MAX_BODY_BYTES = 1024 * 1024;
-	public static final int PROTOCOL_VERSION = 1;
+	public static final int PROTOCOL_VERSION = 2;
 
 	private final ProgramRegistry registry;
 	private final int requestedPort;
@@ -39,6 +39,7 @@ public final class BridgeServer {
 			server.createContext("/health", this::handleHealth);
 			server.createContext("/v1/programs", this::handlePrograms);
 			server.createContext("/v1/invoke", this::handleInvoke);
+			server.createContext("/v1/import", this::handleImport);
 			server.setExecutor(Executors.newCachedThreadPool(runnable -> {
 				Thread thread = new Thread(runnable, "aether-ghidra-bridge");
 				thread.setDaemon(true);
@@ -89,12 +90,18 @@ public final class BridgeServer {
 		}
 		try {
 			Map<String, Object> request = Json.object(readJson(exchange));
+			Object requestVersion = request.get("protocol_version");
+			if (!(requestVersion instanceof Number number) || number.intValue() != PROTOCOL_VERSION) {
+				throw new ProgramRegistry.BridgeException("protocol_mismatch",
+					"Unsupported bridge protocol version: " + requestVersion);
+			}
 			String programId = Json.string(request, "program_id");
 			String capability = Json.string(request, "capability");
 			DebugLog.debug(this, "bridge invoke program_id=" + programId + " capability=" + capability);
 			Map<String, Object> arguments = Json.optionalObject(request, "arguments");
 			Map<String, Object> response = new LinkedHashMap<>();
 			response.put("ok", true);
+			response.put("protocol_version", PROTOCOL_VERSION);
 			response.put("result", registry.invoke(programId, capability, arguments));
 			writeJson(exchange, 200, response);
 		}
@@ -106,6 +113,52 @@ public final class BridgeServer {
 			Msg.error(this, "AETHER bridge request failed", e);
 			writeError(exchange, 500, "internal_error", e.getMessage());
 		}
+	}
+
+	private void handleImport(HttpExchange exchange) throws IOException {
+		if (!method(exchange, "POST")) {
+			return;
+		}
+		try {
+			Map<String, Object> request = Json.object(readJson(exchange));
+			Object requestVersion = request.get("protocol_version");
+			if (!(requestVersion instanceof Number number) || number.intValue() != PROTOCOL_VERSION) {
+				throw new ProgramRegistry.BridgeException("protocol_mismatch",
+					"Unsupported bridge protocol version: " + requestVersion);
+			}
+			String path = importPath(request);
+			DebugLog.debug(this, "bridge import path=" + path);
+			Map<String, Object> response = new LinkedHashMap<>();
+			response.put("ok", true);
+			response.put("protocol_version", PROTOCOL_VERSION);
+			response.put("result", registry.importProgram(new java.io.File(path)));
+			writeJson(exchange, 200, response);
+		}
+		catch (ProgramRegistry.BridgeException e) {
+			DebugLog.debug(this, "bridge import rejected code=" + e.code());
+			writeError(exchange, 400, e.code(), e.getMessage());
+		}
+		catch (IllegalArgumentException e) {
+			writeError(exchange, 400, "invalid_argument", e.getMessage());
+		}
+		catch (Exception e) {
+			Msg.error(this, "AETHER bridge import failed", e);
+			writeError(exchange, 500, "internal_error", e.getMessage());
+		}
+	}
+
+	private static String importPath(Map<String, Object> request) {
+		Object value = request.get("path");
+		if (value == null) {
+			value = request.get("file_path");
+		}
+		if (value == null) {
+			value = request.get("file");
+		}
+		if (!(value instanceof String path) || path.isBlank()) {
+			throw new ProgramRegistry.BridgeException("invalid_argument", "path is required");
+		}
+		return path;
 	}
 
 	private static boolean method(HttpExchange exchange, String expected) throws IOException {

@@ -44,6 +44,13 @@ class FakeRuntime:
         return {"job_id": "job-1", "state": "queued"}
 
     def annotation_job(self, job_id):
+        if job_id == "missing-job":
+            return {
+                "job_id": job_id,
+                "state": "lost",
+                "message": "Annotation job is no longer available",
+                "error": "Annotation job lost because the Python agent restarted.",
+            }
         return {"job_id": job_id, "state": "completed", "progress": 100}
 
     def cancel_annotation(self, job_id):
@@ -84,7 +91,7 @@ class ServiceRouteTests(unittest.TestCase):
         status, health = self.request("GET", "/health")
         self.assertEqual(status, 200)
         self.assertTrue(health["ok"])
-        self.assertEqual(health["protocol_version"], 1)
+        self.assertEqual(health["protocol_version"], 2)
 
         status, programs = self.request("GET", "/v1/programs")
         self.assertEqual(status, 200)
@@ -140,6 +147,10 @@ class ServiceRouteTests(unittest.TestCase):
         status, cancelled = self.request("POST", "/v1/annotation-jobs/job-1/cancel", {})
         self.assertEqual(status, 200)
         self.assertEqual(cancelled["result"]["state"], "cancelled")
+
+        status, missing = self.request("GET", "/v1/annotation-jobs/missing-job")
+        self.assertEqual(status, 200)
+        self.assertEqual(missing["result"]["state"], "lost")
 
         status, undone = self.request("POST", "/v1/annotations/undo", {"program_id": "program-1"})
         self.assertEqual(status, 200)

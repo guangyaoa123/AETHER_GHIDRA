@@ -11,6 +11,7 @@ from ...config.settings import load_config
 from .history import AnnotationHistory
 from ...config.tool_policy import capability_enabled
 from ...observability.conversation_logging import ConversationLogger
+from ...integrations.ghidra.identity import function_address, function_ref as normalize_function_ref, structured_address
 from ...tools.catalog import CAPABILITY_TO_TOOL, TOOL_GROUP_BY_NAME, ChatbotToolbox, ToolNames
 from .staging import MutationStaging
 
@@ -28,6 +29,7 @@ GATHERING_CAPABILITIES = frozenset({"get_function_call_tree", "get_annotation_co
 ANNOTATION_CAPABILITIES = frozenset({
     "rename_function", "rename_variable", "retype_variable", "update_function_definition",
     "set_function_comment", "set_code_unit_comment",
+    "resolve_pseudocode_call",
     "apply_annotation_batch",
 })
 
@@ -56,9 +58,11 @@ class AnnotationWorkflow:
             raise PermissionError("Enable the annotation write tool group before annotating")
 
         logger.info("annotation flow start program_id=%s mode=%s address=%s", self.program_id, mode, request.get("address"))
+        root_ref = request.get("function_ref") or {"address": request.get("address")}
+        root_address = function_address(root_ref)
         self._report_progress("Gathering candidate functions", 10)
         tree = self._gather("get_function_call_tree", {
-            "address": request.get("address"),
+            "address": root_address,
             "direction": "callees",
             "max_depth": int(request.get("max_depth", 5)),
             "max_functions": int(request.get("max_functions", 30)),
@@ -176,15 +180,10 @@ class AnnotationWorkflow:
             if not requested:
                 return [self._function_ref(candidates[0])] if candidates else []
             allowed = {self._address_key(item.get("address")): item for item in candidates}
-            allowed_names = {str(item.get("name")): item for item in candidates}
             selected = []
             for item in requested:
-                if isinstance(item, dict):
-                    candidate = allowed.get(self._address_key(item.get("address")))
-                    if candidate is None:
-                        candidate = allowed_names.get(str(item.get("name", "")))
-                else:
-                    candidate = allowed_names.get(str(item)) or allowed.get(self._address_key(item))
+                candidate_ref = item.get("function_ref", item) if isinstance(item, dict) else None
+                candidate = allowed.get(self._address_key(candidate_ref.get("address"))) if isinstance(candidate_ref, dict) else None
                 if candidate is not None:
                     selected.append(self._function_ref(candidate))
             root = self._function_ref(candidates[0]) if candidates else None
@@ -194,7 +193,7 @@ class AnnotationWorkflow:
 
         prompt = self._prompt("gatherer.txt") + "\n\n" + json.dumps(
             {
-                "candidates": candidates,
+                "candidates": [{**item, "function_ref": self._function_ref(item)} for item in candidates],
                 "function_sketches": self._gatherer_context(candidate_context),
             },
             indent=2,
@@ -208,7 +207,8 @@ class AnnotationWorkflow:
         for item in decoded.get("selected_functions", []):
             if not isinstance(item, dict):
                 continue
-            key = self._address_key(item.get("address"))
+            selected_ref = item.get("function_ref", item)
+            key = self._address_key(selected_ref.get("address")) if isinstance(selected_ref, dict) else ""
             if key in allowed and key not in selected_keys:
                 selected.append(self._function_ref(allowed[key]))
                 selected_keys.add(key)
@@ -227,7 +227,7 @@ class AnnotationWorkflow:
             return []
         return [
             {
-                "address": item.get("address"),
+                "function_ref": {"address": item.get("address"), "name": item.get("name", "")},
                 "pseudocode_sketch": AnnotationWorkflow._compact_pseudocode(item.get("pseudocode", "")),
             }
             for item in context.get("functions", [])
@@ -295,8 +295,8 @@ class AnnotationWorkflow:
         prompt = self._prompt("annotator.txt")
         if guidance:
             prompt += "\n\nAnalysis guidance from the user:\n" + guidance
-        prompt += "\n\nPseudocode:\n" + json.dumps(
-            [item.get("pseudocode", "") for item in context.get("functions", [])],
+        prompt += "\n\nPseudocode mapped to exact function_ref:\n" + json.dumps(
+            [{"function_ref": self._function_ref(item), "pseudocode": item.get("pseudocode", "")} for item in context.get("functions", [])],
             indent=2,
             ensure_ascii=True,
         )
@@ -342,13 +342,19 @@ class AnnotationWorkflow:
             target = operation.get("target")
             if not isinstance(target, dict):
                 continue
-            function_address = target.get("function_address")
-            if operation["kind"] != "set_code_unit_comment" and function_address is None:
+            function_address_value = target.get("function_address")
+            if operation["kind"] != "set_code_unit_comment" and function_address_value is None:
                 continue
-            if function_address is not None and self._address_key(function_address) not in allowed_functions:
+            if operation["kind"] != "set_code_unit_comment" and not isinstance(function_address_value, dict):
+                continue
+            if function_address_value is not None and self._address_key(function_address_value) not in allowed_functions:
                 continue
             if operation["kind"] == "set_code_unit_comment":
-                if not target.get("address") or operation.get("comment_kind", "eol") not in {"eol", "pre", "post", "plate", "repeatable"}:
+                try:
+                    target["address"] = structured_address(target.get("address"), "location")
+                except ValueError:
+                    continue
+                if operation.get("comment_kind", "eol") not in {"eol", "pre", "post", "plate", "repeatable"}:
                     continue
                 operation["comment_kind"] = operation.get("comment_kind", "eol")
             if operation["kind"] == "rename_variable" and not target.get("variable_name"):
@@ -395,6 +401,7 @@ class AnnotationWorkflow:
             ToolNames.UPDATE_FUNCTION_DEFINITION.value,
             ToolNames.SET_FUNCTION_COMMENT.value,
             ToolNames.SET_CODE_UNIT_COMMENT.value,
+            ToolNames.RESOLVE_PSEUDOCODE_CALL.value,
         }
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system},
@@ -503,8 +510,10 @@ class AnnotationWorkflow:
         if not isinstance(arguments, dict):
             return "json"
         return (
-            arguments.get("function_name")
+            arguments.get("function_ref")
             or arguments.get("variable_name")
+            or arguments.get("structure_path")
+            or arguments.get("class_ref")
             or arguments.get("location")
             or arguments.get("address")
             or "-"
@@ -533,13 +542,17 @@ class AnnotationWorkflow:
 
     @staticmethod
     def _function_ref(item: dict[str, Any]) -> dict[str, Any]:
-        return {"address": item.get("address"), "name": item.get("name", "")}
+        return normalize_function_ref({"address": item.get("address"), "name": item.get("name", "")})
 
     @staticmethod
     def _is_decompilable_candidate(item: Any) -> bool:
         if not isinstance(item, dict) or item.get("external") or item.get("thunk"):
             return False
         address = item.get("address")
+        try:
+            function_address({"address": address})
+        except ValueError:
+            return False
         if isinstance(address, dict):
             return str(address.get("space", "")).upper() != "EXTERNAL"
         return not str(address or "").upper().startswith("EXTERNAL:")

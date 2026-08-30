@@ -17,7 +17,7 @@ class TruncationStrategy(Enum):
 
 
 TOOL_PRIORITY = {
-    "add_memory": "HIGH", "search_memory": "HIGH", "get_function_pseudocode": "MEDIUM",
+    "add_memory": "HIGH", "search_memory": "HIGH", "get_function": "MEDIUM",
     "get_data_at_address": "MEDIUM", "list_functions": "LOW",
 }
 

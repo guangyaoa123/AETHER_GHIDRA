@@ -18,7 +18,6 @@ public final class AetherToolConfigStore {
 		System.getProperty("user.home"), ".config", "aether-ghidra", "chatbot-tool-config.json");
 	private static final Map<String, Boolean> DEFAULT_GROUPS = Map.ofEntries(
 		Map.entry("program_read", true),
-		Map.entry("analysis_context", true),
 		Map.entry("program_write", false),
 		Map.entry("planning", true),
 		Map.entry("memory", true),
@@ -26,11 +25,12 @@ public final class AetherToolConfigStore {
 	private static final Map<String, Boolean> ANNOTATION_GROUP_DEFAULTS = Map.ofEntries(
 		Map.entry("annotation_read", true), Map.entry("annotation_write", false));
 	private static final Map<String, List<String>> LEGACY_TO_GROUP = Map.ofEntries(
-		Map.entry("program_read", List.of("list_functions", "get_function_pseudocode",
-			"get_data_at_address", "get_xrefs_to")),
-		Map.entry("analysis_context", List.of("add_to_function_list", "remove_from_function_list")),
+        Map.entry("program_read", List.of("list_functions", "get_function",
+			"get_data_at_address", "get_xrefs_to", "list_struct", "get_struct")),
 		Map.entry("program_write", List.of("rename_function", "rename_variable", "set_function_comment",
-			"set_code_unit_comment", "retype_variable", "update_function_definition")),
+			"set_code_unit_comment", "retype_variable", "update_function_definition", "create_struct",
+			"add_fields", "update_fields", "remove_fields", "resize_struct", "create_class",
+			"update_class", "delete_class")),
 		Map.entry("planning", List.of("add_action_plan", "add_task_to_plan", "update_task",
 			"remove_task_from_plan", "remove_action_plan")),
 		Map.entry("memory", List.of("add_memory", "remove_memory", "search_memory")),

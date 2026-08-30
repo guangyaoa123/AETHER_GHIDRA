@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ...integrations.ghidra.chatbot_backend import GhidraChatbotBackendBridge
+from ...integrations.ghidra.identity import structured_address
 from ...engine import (
     AgentLoopExecutor,
     AgentCancelled,
@@ -32,9 +33,6 @@ from ...tools.catalog import CHATBOT_TOOL_SPECS, TOOL_GROUP_BY_NAME, ChatbotTool
 
 
 logger = logging.getLogger("aether_ghidra.chatbot")
-MAX_FUNCTION_LIST_SIZE = 10
-
-
 class TaskStatus(StrEnum):
     NOT_STARTED = "Not Started"
     IN_PROGRESS = "In Progress"
@@ -128,27 +126,6 @@ class ChatbotAgentState:
     def conversation_history(self, history: list[dict[str, Any]]) -> None:
         self.runtime.set_agent_conversation_history("chatbot", history)
 
-    @property
-    def function_list(self) -> list[dict[str, Any]]:
-        return self.context.setdefault("function_list", [])
-
-    def add_to_function_list(self, function_name: str) -> str:
-        function = self.bridge.resolve_function(function_name)
-        if function is None:
-            return f"Error: Function '{function_name}' not found."
-        if function in self.function_list:
-            return f"'{function_name}' is already in the analysis list."
-        if len(self.function_list) >= MAX_FUNCTION_LIST_SIZE:
-            return f"Function List is full (max {MAX_FUNCTION_LIST_SIZE})"
-        self.function_list.append(function)
-        return f"Added '{function_name}' to analysis list."
-
-    def remove_from_function_list(self, function_name: str) -> None:
-        function = self.bridge.resolve_function(function_name)
-        if function is None or function not in self.function_list:
-            raise KeyError(f"Function '{function_name}' not found in analysis list.")
-        self.function_list.remove(function)
-
     def add_memory(self, key: str, value: Any, category: str, priority: str = "MEDIUM", tags: list[str] | None = None) -> None:
         try:
             selected_priority = MemoryPriority[priority.upper()]
@@ -238,12 +215,10 @@ class ChatbotAgentState:
         memories = list(self.memory_store.memories.values())
         plans = self.plan_manager.all_plans
         plan_text = "No active plans." if not plans else "\n".join(plan.summary() for plan in plans)
-        functions = ", ".join(self.bridge.get_function_name(item) for item in self.function_list) or "none"
         return (
             "ChatbotAgentState:\n"
             f"- Memory Store: {len(memories)} memories\n"
-            f"- Plan Manager:\n{plan_text}\n"
-            f"- Function List: [{functions}]"
+            f"- Plan Manager:\n{plan_text}"
         )
 
 
@@ -376,6 +351,8 @@ class ChatbotAgent:
         cancel = cancel or threading.Event()
         if cancel.is_set():
             raise AgentCancelled("Chat cancelled")
+        if address is not None:
+            address = structured_address(address, "address")
         user_content = task
         if address:
             user_content = f"[Selected Ghidra address: {json.dumps(address)}]\n{task}"

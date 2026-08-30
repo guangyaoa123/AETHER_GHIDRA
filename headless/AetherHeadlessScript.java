@@ -1,29 +1,41 @@
 import aether.ghidra.headless.HeadlessAetherRuntime;
 
+import ghidra.framework.options.Options;
 import ghidra.app.script.GhidraScript;
 
 /**
- * Starts the same AETHER bridge and Python agent used by the GUI plugin for the
- * current headless Program. Use AETHER_HEADLESS_DURATION_SEC to control how
- * long the service remains available for external annotation requests.
+ * Starts the same AETHER bridge and Python agent used by the GUI plugin. When
+ * a current Program exists, it also recovers C++ RTTI classes before waiting;
+ * without one, it remains available as an empty runtime for later imports.
+ * The runtime remains available until the owning MCP server or analysis
+ * session explicitly closes it.
  */
 public class AetherHeadlessScript extends GhidraScript {
     @Override
     public void run() throws Exception {
-        if (currentProgram == null) {
-            throw new IllegalStateException("AETHER headless mode requires an imported current Program");
-        }
         int bridgePort = integerEnvironment("AETHER_GHIDRA_PORT", 8765);
-        int duration = integerEnvironment("AETHER_HEADLESS_DURATION_SEC", 300);
         HeadlessAetherRuntime runtime = new HeadlessAetherRuntime(currentProgram, bridgePort);
         runtime.start();
         try {
             println("AETHER headless bridge listening on http://127.0.0.1:" + runtime.bridgePort());
             println("AETHER headless programs: " + runtime.registry().listPrograms());
-            println("AETHER headless runtime active for " + duration + " seconds");
-            long deadline = System.currentTimeMillis() + duration * 1000L;
-            while (System.currentTimeMillis() < deadline) {
-                Thread.sleep(Math.min(1000L, Math.max(1L, deadline - System.currentTimeMillis())));
+            if (currentProgram != null) {
+                try {
+                    Options options = currentProgram.getOptions("AETHER");
+                    options.setString("rtti_import_recovery_state", "running");
+                    println("Running Ghidra RTTI recovery and AETHER inheritance analysis...");
+                    runScript("AetherRecoverClassesAndAnalyze.java");
+                    options.setString("rtti_import_recovery_state", "completed");
+                    println("AETHER import-time RTTI recovery complete.");
+                }
+                catch (Exception error) {
+                    currentProgram.getOptions("AETHER").setString("rtti_import_recovery_state", "failed");
+                    println("AETHER import-time RTTI recovery skipped: " + error.getMessage());
+                }
+            }
+            println("AETHER headless runtime active until explicitly closed");
+            while (true) {
+                Thread.sleep(1000L);
             }
         }
         finally {

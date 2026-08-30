@@ -3,8 +3,10 @@ package aether.ghidra.plugin;
 import java.util.LinkedHashMap;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 
 import javax.swing.SwingUtilities;
@@ -16,26 +18,44 @@ import docking.action.MenuData;
 import docking.actions.PopupActionProvider;
 import ghidra.app.events.ProgramActivatedPluginEvent;
 import ghidra.app.events.ProgramClosedPluginEvent;
+import ghidra.app.events.ProgramLocationPluginEvent;
 import ghidra.app.events.ProgramOpenedPluginEvent;
 import ghidra.app.context.ProgramLocationActionContext;
+import ghidra.app.nav.Navigatable;
 import ghidra.app.plugin.PluginCategoryNames;
 import ghidra.app.services.ProgramManager;
+import ghidra.app.services.GoToService;
+import ghidra.app.services.DataTypeManagerService;
+import ghidra.framework.model.DomainObjectChangedEvent;
+import ghidra.framework.model.DomainObjectListener;
 import ghidra.framework.plugintool.Plugin;
 import ghidra.framework.plugintool.PluginInfo;
 import ghidra.framework.plugintool.PluginTool;
 import ghidra.program.model.listing.Program;
+import ghidra.program.model.data.DataType;
+import ghidra.program.model.data.DataTypePath;
 import ghidra.framework.plugintool.util.PluginStatus;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressSpace;
+import ghidra.program.util.AddressFieldLocation;
+import ghidra.program.util.GhidraProgramUtilities;
+import ghidra.program.util.ProgramEvent;
 import ghidra.util.Msg;
+import ghidra.util.task.TaskMonitor;
+import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
+import ghidra.program.util.ProgramLocation;
 
 import aether.ghidra.AetherPluginPackage;
 import aether.ghidra.bridge.BridgeServer;
 import aether.ghidra.bridge.Json;
 import aether.ghidra.observability.DebugLog;
+import aether.ghidra.program.RttiRecoveryRunner;
 import aether.ghidra.program.ProgramRegistry;
 import aether.ghidra.plugin.config.AetherToolConfigStore;
 import aether.ghidra.plugin.ui.AetherConfigDialog;
 import aether.ghidra.plugin.ui.AnnotationDialog;
 import aether.ghidra.plugin.ui.ChatProvider;
+import aether.ghidra.plugin.ui.ClassInfoProvider;
 import aether.ghidra.plugin.ui.IndexProvider;
 
 /** Ghidra-side lifecycle and bridge owner for the AETHER integration. */
@@ -65,9 +85,15 @@ public class AetherPlugin extends Plugin implements PopupActionProvider {
 	private DockingAction undoAnnotationAction;
 	private DockingAction configAction;
 	private DockingAction indexAction;
+	private DockingAction classInfoAction;
+	private DockingAction rttiRecoveryAction;
 	private volatile String activeAnnotationJobId;
 	private ChatProvider chatProvider;
 	private IndexProvider indexProvider;
+	private ClassInfoProvider classInfoProvider;
+	private final Map<Program, DomainObjectListener> programListeners = new IdentityHashMap<>();
+	private final Set<Program> rttiRecoveryScheduled =
+		Collections.newSetFromMap(new IdentityHashMap<>());
 
 	public AetherPlugin(PluginTool tool) {
 		super(tool);
@@ -138,7 +164,88 @@ public class AetherPlugin extends Plugin implements PopupActionProvider {
 				return agentClient.indexEntries(programId);
 			}
 		});
+		classInfoProvider = new ClassInfoProvider(tool, getName(), new ClassInfoProvider.Backend() {
+			@Override
+			public Map<String, Object> listStructures(String programId) {
+				try {
+					return registry.invoke(programId, "list_struct",
+						Map.of("kind", "class", "grouped", true, "limit", 1000));
+				}
+				catch (Exception error) {
+					throw new RuntimeException(error.getMessage(), error);
+				}
+			}
+
+			@Override
+			public Map<String, Object> getStructure(String programId, String path) {
+				try {
+					return registry.invoke(programId, "get_struct", Map.of("path", path));
+				}
+				catch (Exception error) {
+					throw new RuntimeException(error.getMessage(), error);
+				}
+			}
+
+			@Override
+			public void navigateToAddress(String programId, Map<String, Object> address) {
+				Program program = registry.programFor(programId);
+				if (program == null) {
+					return;
+				}
+				String spaceName = address.get("space") == null ? null : String.valueOf(address.get("space"));
+				AddressSpace space = spaceName == null
+					? program.getAddressFactory().getDefaultAddressSpace()
+					: program.getAddressFactory().getAddressSpace(spaceName);
+				if (space == null) {
+					throw new IllegalArgumentException("Unknown address space: " + spaceName);
+				}
+				String offset = String.valueOf(address.get("offset"));
+				if (offset.startsWith("0x") || offset.startsWith("0X")) {
+					offset = offset.substring(2);
+				}
+				try {
+					Address target = space.getAddress(Long.parseUnsignedLong(offset, 16));
+					ProgramLocation location = new ProgramLocation(program, target);
+					GoToService goToService = tool.getService(GoToService.class);
+					boolean moved = false;
+					if (goToService != null) {
+						Navigatable navigatable = goToService.getDefaultNavigatable();
+						if (navigatable != null) {
+							moved = navigatable.goTo(program, new AddressFieldLocation(program, target));
+							if (moved) {
+								navigatable.requestFocus();
+							}
+						}
+						if (!moved) {
+							moved = goToService.goTo(target, program);
+						}
+					}
+					if (!moved) {
+						tool.firePluginEvent(new ProgramLocationPluginEvent(getName(), location, program));
+					}
+				}
+				catch (RuntimeException error) {
+					throw new IllegalArgumentException("Invalid address: " + address, error);
+				}
+			}
+
+			@Override
+			public void selectDataType(String programId, String path) {
+				AetherPlugin.this.selectDataType(programId, path);
+			}
+
+			@Override
+			public void editDataType(String programId, String path) {
+				AetherPlugin.this.editDataType(programId, path);
+			}
+		});
 		ProgramManager programManager = tool.getService(ProgramManager.class);
+		if (programManager != null) {
+			for (Program openProgram : programManager.getAllOpenPrograms()) {
+				attachProgramListener(openProgram);
+				scheduleRttiRecovery(openProgram);
+			}
+		}
 		Program currentProgram = programManager == null ? null : programManager.getCurrentProgram();
 		String currentProgramId = registry.idFor(currentProgram);
 		SwingUtilities.invokeLater(() -> {
@@ -150,6 +257,12 @@ public class AetherPlugin extends Plugin implements PopupActionProvider {
 				indexProvider.selectProgram(currentProgramId);
 				if (!indexProvider.isInTool()) {
 					indexProvider.addToTool();
+				}
+			}
+			if (classInfoProvider != null) {
+				classInfoProvider.selectProgram(currentProgramId);
+				if (!classInfoProvider.isInTool()) {
+					classInfoProvider.addToTool();
 				}
 			}
 		});
@@ -164,12 +277,58 @@ public class AetherPlugin extends Plugin implements PopupActionProvider {
 		createAnalyzeAction();
 		createChatAction();
 		createIndexAction();
+		createClassInfoAction();
+		createRttiRecoveryAction();
 		createAnnotationActions();
 		createConfigAction();
+		tool.addAction(classInfoAction);
+		tool.addAction(rttiRecoveryAction);
 		tool.addPopupActionProvider(this);
 
 		Msg.info(this, "AETHER Ghidra bridge listening on http://127.0.0.1:" +
 			bridgeServer.getPort() + " (authentication disabled; localhost only)");
+	}
+
+	private void selectDataType(String programId, String path) {
+		DataTypeManagerService service = dataTypeManagerService();
+		service.setDataTypeSelected(resolveProgramDataType(programId, path));
+	}
+
+	private void editDataType(String programId, String path) {
+		DataTypeManagerService service = dataTypeManagerService();
+		DataType dataType = resolveProgramDataType(programId, path);
+		if (!service.isEditable(dataType)) {
+			throw new IllegalArgumentException("Type is not editable: " + path);
+		}
+		service.edit(dataType);
+	}
+
+	private DataTypeManagerService dataTypeManagerService() {
+		DataTypeManagerService service = tool.getService(DataTypeManagerService.class);
+		if (service == null) {
+			throw new IllegalStateException("Ghidra Data Type Manager service is unavailable");
+		}
+		return service;
+	}
+
+	private DataType resolveProgramDataType(String programId, String path) {
+		Program program = registry.programFor(programId);
+		if (program == null) {
+			throw new IllegalArgumentException("Program is not open: " + programId);
+		}
+		if (path == null || !path.startsWith("/")) {
+			throw new IllegalArgumentException("Invalid data type path: " + path);
+		}
+		int separator = path.lastIndexOf('/');
+		if (separator <= 0 || separator == path.length() - 1) {
+			throw new IllegalArgumentException("Invalid data type path: " + path);
+		}
+		DataType dataType = program.getDataTypeManager().getDataType(
+			new DataTypePath(path.substring(0, separator), path.substring(separator + 1)));
+		if (dataType == null) {
+			throw new IllegalArgumentException("Data type not found: " + path);
+		}
+		return dataType;
 	}
 
 	@Override
@@ -177,6 +336,8 @@ public class AetherPlugin extends Plugin implements PopupActionProvider {
 		if (event instanceof ProgramOpenedPluginEvent opened) {
 			DebugLog.debug(this, "program opened");
 			registry.register(opened.getProgram());
+			attachProgramListener(opened.getProgram());
+			scheduleRttiRecovery(opened.getProgram());
 		}
 		else if (event instanceof ProgramClosedPluginEvent closed) {
 			DebugLog.debug(this, "program closed");
@@ -187,24 +348,98 @@ public class AetherPlugin extends Plugin implements PopupActionProvider {
 			if (indexProvider != null && programId != null) {
 				indexProvider.selectProgram(null);
 			}
+			if (classInfoProvider != null && programId != null) {
+				classInfoProvider.selectProgram(null);
+			}
+			detachProgramListener(closed.getProgram());
+			synchronized (rttiRecoveryScheduled) {
+				rttiRecoveryScheduled.remove(closed.getProgram());
+			}
 			registry.unregister(closed.getProgram());
 		}
 		else if (event instanceof ProgramActivatedPluginEvent activated) {
 			DebugLog.debug(this, "program activated");
 			registry.setActive(activated.getActiveProgram());
+			scheduleRttiRecovery(activated.getActiveProgram());
 			if (chatProvider != null) {
 				chatProvider.selectProgram(registry.idFor(activated.getActiveProgram()));
 			}
 			if (indexProvider != null) {
 				indexProvider.selectProgram(registry.idFor(activated.getActiveProgram()));
 			}
+			if (classInfoProvider != null) {
+				classInfoProvider.selectProgram(registry.idFor(activated.getActiveProgram()));
+			}
 		}
+	}
+
+	private void scheduleRttiRecovery(Program program) {
+		if (program == null) {
+			return;
+		}
+		synchronized (rttiRecoveryScheduled) {
+			if (!rttiRecoveryScheduled.add(program)) {
+				return;
+			}
+		}
+		if (program.isClosed()) {
+			return;
+		}
+		CompletableFuture.runAsync(() -> {
+			try {
+				if (!waitForInitialAnalysis(program)) {
+					return;
+				}
+				if (program.isClosed()) {
+					return;
+				}
+				SwingUtilities.invokeLater(() -> tool.setStatusInfo(
+					"AETHER is recovering C++ RTTI classes..."));
+				RttiRecoveryRunner.run(tool, program, TaskMonitor.DUMMY);
+				SwingUtilities.invokeLater(() -> tool.setStatusInfo(
+					"AETHER C++ RTTI recovery complete"));
+			}
+			catch (Exception error) {
+				SwingUtilities.invokeLater(() -> Msg.showError(AetherPlugin.this, null,
+					"AETHER RTTI Recovery", error.getMessage()));
+			}
+		});
+	}
+
+	private boolean waitForInitialAnalysis(Program program) {
+		long deadline = System.currentTimeMillis() + 10 * 60 * 1000L;
+		boolean analysisStarted = GhidraProgramUtilities.isAnalyzed(program);
+		while (!program.isClosed() && System.currentTimeMillis() < deadline) {
+			boolean analyzing = AutoAnalysisManager.getAnalysisManager(program).isAnalyzing();
+			analysisStarted |= analyzing;
+			if (analysisStarted && !analyzing) {
+				return true;
+			}
+			try {
+				Thread.sleep(250L);
+			}
+			catch (InterruptedException error) {
+				Thread.currentThread().interrupt();
+				return false;
+			}
+		}
+		return false;
 	}
 
 	@Override
 	protected void dispose() {
 		DebugLog.debug(this, "disposing plugin");
+		for (Map.Entry<Program, DomainObjectListener> entry : programListeners.entrySet()) {
+			entry.getKey().removeListener(entry.getValue());
+		}
+		programListeners.clear();
 		tool.removePopupActionProvider(this);
+		if (classInfoAction != null) {
+			tool.removeAction(classInfoAction);
+		}
+		if (rttiRecoveryAction != null) {
+			tool.removeAction(rttiRecoveryAction);
+		}
 		if (analyzeAction != null) {
 			analyzeAction = null;
 		}
@@ -216,8 +451,14 @@ public class AetherPlugin extends Plugin implements PopupActionProvider {
 			indexProvider.close();
 			indexProvider = null;
 		}
+		if (classInfoProvider != null) {
+			classInfoProvider.close();
+			classInfoProvider = null;
+		}
 		chatAction = null;
 		indexAction = null;
+		classInfoAction = null;
+		rttiRecoveryAction = null;
 		annotationAction = null;
 		cancelAnnotationAction = null;
 		undoAnnotationAction = null;
@@ -237,6 +478,57 @@ public class AetherPlugin extends Plugin implements PopupActionProvider {
 			registry = null;
 		}
 		super.dispose();
+	}
+
+	private void attachProgramListener(Program program) {
+		if (program == null || programListeners.containsKey(program)) {
+			return;
+		}
+		DomainObjectListener listener = event -> {
+			if (!isClassInformationChange(event)) {
+				return;
+			}
+			String programId = registry.idFor(program);
+			ClassInfoProvider provider = classInfoProvider;
+			if (programId != null && provider != null) {
+				provider.programChanged(programId);
+			}
+		};
+		program.addListener(listener);
+		programListeners.put(program, listener);
+	}
+
+	private void detachProgramListener(Program program) {
+		DomainObjectListener listener = programListeners.remove(program);
+		if (listener != null) {
+			program.removeListener(listener);
+		}
+	}
+
+	private static boolean isClassInformationChange(DomainObjectChangedEvent event) {
+		return event.contains(
+			ProgramEvent.DATA_TYPE_CATEGORY_ADDED,
+			ProgramEvent.DATA_TYPE_CATEGORY_REMOVED,
+			ProgramEvent.DATA_TYPE_CATEGORY_RENAMED,
+			ProgramEvent.DATA_TYPE_CATEGORY_MOVED,
+			ProgramEvent.DATA_TYPE_ADDED,
+			ProgramEvent.DATA_TYPE_REMOVED,
+			ProgramEvent.DATA_TYPE_RENAMED,
+			ProgramEvent.DATA_TYPE_MOVED,
+			ProgramEvent.DATA_TYPE_CHANGED,
+			ProgramEvent.DATA_TYPE_REPLACED,
+			ProgramEvent.SYMBOL_ADDED,
+			ProgramEvent.SYMBOL_REMOVED,
+			ProgramEvent.SYMBOL_RENAMED,
+			ProgramEvent.SYMBOL_DATA_CHANGED,
+			ProgramEvent.SYMBOL_ADDRESS_CHANGED,
+			ProgramEvent.FUNCTION_ADDED,
+			ProgramEvent.FUNCTION_REMOVED,
+			ProgramEvent.FUNCTION_CHANGED,
+			ProgramEvent.CODE_ADDED,
+			ProgramEvent.CODE_REMOVED,
+			ProgramEvent.CODE_REPLACED,
+			ghidra.framework.model.DomainObject.DO_PROPERTY_CHANGED);
 	}
 
 	private void createAnalyzeAction() {
@@ -322,6 +614,67 @@ public class AetherPlugin extends Plugin implements PopupActionProvider {
 		};
 		indexAction.setPopupMenuData(new MenuData(new String[] { "AETHER", "Index / Resume Binary" }));
 		indexAction.setDescription("Create or resume the persistent function index for this Program");
+	}
+
+	private void createClassInfoAction() {
+		classInfoAction = new DockingAction("Show Class Information", getName()) {
+			@Override
+			public boolean isEnabledForContext(ActionContext context) {
+				return activeProgramId() != null;
+			}
+
+			@Override
+			public void actionPerformed(ActionContext context) {
+				if (classInfoProvider == null) {
+					return;
+				}
+				classInfoProvider.selectProgram(activeProgramId());
+				classInfoProvider.showDockable();
+			}
+		};
+		classInfoAction.setMenuBarData(new MenuData(new String[] { "AETHER", "Class Information" }));
+		classInfoAction.setDescription("Display analyzed structures, classes, inheritance, and vtable relationships");
+	}
+
+	private void createRttiRecoveryAction() {
+		rttiRecoveryAction = new DockingAction("Recover C++ RTTI Classes", getName()) {
+			@Override
+			public boolean isEnabledForContext(ActionContext context) {
+				return activeProgramId() != null;
+			}
+
+			@Override
+			public void actionPerformed(ActionContext context) {
+				runRttiRecovery();
+			}
+		};
+		rttiRecoveryAction.setMenuBarData(new MenuData(new String[] { "AETHER", "Recover C++ RTTI Classes" }));
+		rttiRecoveryAction.setDescription(
+			"Run Ghidra class recovery, then refresh AETHER inheritance and vtable analysis");
+	}
+
+	private void runRttiRecovery() {
+		ProgramManager programManager = tool.getService(ProgramManager.class);
+		Program program = programManager == null ? null : programManager.getCurrentProgram();
+		if (program == null) {
+			return;
+		}
+		tool.setStatusInfo("AETHER is recovering C++ RTTI classes...");
+		CompletableFuture.runAsync(() -> {
+			try {
+				RttiRecoveryRunner.run(tool, program, TaskMonitor.DUMMY);
+				SwingUtilities.invokeLater(() -> {
+					if (classInfoProvider != null) {
+						classInfoProvider.selectProgram(registry.idFor(program));
+					}
+					tool.setStatusInfo("AETHER C++ RTTI recovery complete");
+				});
+			}
+			catch (Exception error) {
+				SwingUtilities.invokeLater(() -> Msg.showError(AetherPlugin.this, null,
+					"AETHER RTTI Recovery", error.getMessage()));
+			}
+		});
 	}
 
 	private void createConfigAction() {
@@ -469,6 +822,11 @@ public class AetherPlugin extends Plugin implements PopupActionProvider {
 			Msg.info(this, "AETHER configuration saved; restart the plugin or managed agent to apply it.");
 			return;
 		}
+		if (activeAnnotationJobId != null) {
+			Msg.showWarn(this, null, "AETHER Configuration",
+				"Configuration saved. The Python agent will not restart until the active annotation finishes.");
+			return;
+		}
 		CompletableFuture.runAsync(() -> {
 			try {
 				agentProcess.restart(bridgeServer.getPort());
@@ -496,6 +854,9 @@ public class AetherPlugin extends Plugin implements PopupActionProvider {
 		if (indexAction != null && canAnalyze(locationContext)) {
 			actions.add(indexAction);
 		}
+		if (classInfoAction != null && canAnalyze(locationContext)) {
+			actions.add(classInfoAction);
+		}
 		if (annotationAction != null && canAnnotate(locationContext)) {
 			actions.add(annotationAction);
 			if (undoAnnotationAction != null) {
@@ -511,6 +872,12 @@ public class AetherPlugin extends Plugin implements PopupActionProvider {
 	private boolean canAnalyze(ProgramLocationActionContext context) {
 		return context != null && context.getProgram() != null && context.getAddress() != null &&
 			registry != null && registry.idFor(context.getProgram()) != null;
+	}
+
+	private String activeProgramId() {
+		ProgramManager programManager = tool.getService(ProgramManager.class);
+		Program program = programManager == null ? null : programManager.getCurrentProgram();
+		return registry == null ? null : registry.idFor(program);
 	}
 
 	private static ProgramLocationActionContext extractLocationContext(ActionContext context) {

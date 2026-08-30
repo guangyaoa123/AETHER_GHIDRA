@@ -45,8 +45,8 @@ class FunctionEntry:
     address: str
     tags: set[str] = field(default_factory=set)
     summary: str = ""
-    called_functions: list[str] = field(default_factory=list)
-    caller_functions: list[str] = field(default_factory=list)
+    called_functions: list[Any] = field(default_factory=list)
+    caller_functions: list[Any] = field(default_factory=list)
     key_operations: list[str] = field(default_factory=list)
     key_constants: list[str] = field(default_factory=list)
 
@@ -55,7 +55,9 @@ class FunctionEntry:
 
     def searchable(self) -> str:
         return " ".join([
-            self.name, self.summary, *self.tags, *self.called_functions, *self.caller_functions,
+            self.name, self.summary, *self.tags,
+            *(json.dumps(value, sort_keys=True, default=str) if isinstance(value, dict) else str(value)
+              for value in [*self.called_functions, *self.caller_functions]),
             *self.key_operations, *self.key_constants,
         ])
 

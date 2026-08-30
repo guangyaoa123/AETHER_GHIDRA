@@ -8,9 +8,11 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from .identity import normalize_bridge_arguments
+
 
 DEFAULT_BRIDGE_URL = "http://127.0.0.1:8765"
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 logger = logging.getLogger(__name__)
 
 
@@ -27,6 +29,7 @@ class BridgeClient:
 
     def __init__(self, base_url: str | None = None) -> None:
         self.base_url = (base_url or os.getenv("AETHER_GHIDRA_URL", DEFAULT_BRIDGE_URL)).rstrip("/")
+        self._protocol_checked = False
 
     def health(self) -> dict[str, Any]:
         response = self._request("GET", "/health")
@@ -35,11 +38,26 @@ class BridgeClient:
                 f"Unsupported Ghidra bridge protocol version: {response.get('protocol_version')}",
                 code="protocol_mismatch",
             )
+        self._protocol_checked = True
         return response
 
+    def _ensure_protocol(self) -> None:
+        if not self._protocol_checked:
+            self.health()
+
     def list_programs(self) -> list[dict[str, Any]]:
+        self._ensure_protocol()
         response = self._request("GET", "/v1/programs")
         return response["programs"]
+
+    def import_program(self, path: str) -> dict[str, Any]:
+        self._ensure_protocol()
+        response = self._request(
+            "POST",
+            "/v1/import",
+            {"protocol_version": PROTOCOL_VERSION, "path": path},
+        )
+        return response["result"]
 
     def invoke(
         self,
@@ -47,13 +65,16 @@ class BridgeClient:
         capability: str,
         arguments: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        normalized_arguments = normalize_bridge_arguments(capability, arguments)
+        self._ensure_protocol()
         response = self._request(
             "POST",
             "/v1/invoke",
             {
+                "protocol_version": PROTOCOL_VERSION,
                 "program_id": program_id,
                 "capability": capability,
-                "arguments": arguments or {},
+                "arguments": normalized_arguments,
             },
         )
         return response["result"]
@@ -94,6 +115,12 @@ class BridgeClient:
             logger.warning("bridge invalid JSON method=%s path=%s", method, path)
             raise BridgeError("Ghidra bridge returned invalid JSON", code="invalid_response") from error
 
+        response_version = decoded.get("protocol_version")
+        if response_version is not None and response_version != PROTOCOL_VERSION:
+            raise BridgeError(
+                f"Unsupported Ghidra bridge protocol version: {response_version}",
+                code="protocol_mismatch",
+            )
         if "ok" in decoded and not decoded["ok"]:
             error = decoded.get("error", {})
             raise BridgeError(error.get("message", "Bridge request failed"), code=error.get("code", "bridge_error"))

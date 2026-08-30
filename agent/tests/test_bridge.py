@@ -15,19 +15,39 @@ from aether_ghidra.engine import AgentCancelled
 class BridgeClientTests(unittest.TestCase):
     def test_invoke_request_shape(self) -> None:
         client = BridgeClient()
-        with patch.object(client, "_request", return_value={"result": {"name": "entry"}}) as request:
+        def request(method, path, payload=None):
+            if path == "/health":
+                return {"ok": True, "protocol_version": 2}
+            return {"result": {"name": "entry"}}
+
+        with patch.object(client, "_request", side_effect=request) as request_mock:
             result = client.invoke("program-1", "get_function", {"address": {"space": "ram", "offset": "1000"}})
 
         self.assertEqual(result, {"name": "entry"})
-        request.assert_called_once_with(
+        self.assertEqual(request_mock.call_args_list[0].args[:2], ("GET", "/health"))
+        request_mock.assert_any_call(
             "POST",
             "/v1/invoke",
             {
+                "protocol_version": 2,
                 "program_id": "program-1",
                 "capability": "get_function",
                 "arguments": {"address": {"space": "ram", "offset": "1000"}},
             },
         )
+
+    def test_health_rejects_protocol_mismatch(self) -> None:
+        client = BridgeClient()
+        with patch.object(client, "_request", return_value={"ok": True, "protocol_version": 99}):
+            with self.assertRaisesRegex(BridgeError, "Unsupported Ghidra bridge protocol version"):
+                client.health()
+
+    def test_invoke_rejects_bare_function_name_before_http(self) -> None:
+        client = BridgeClient()
+        with patch.object(client, "_request") as request:
+            with self.assertRaisesRegex(ValueError, "Bare function-name targets"):
+                client.invoke("program-1", "get_function", {"function_name": "entry"})
+        request.assert_not_called()
 
     def test_analyze_collects_selected_function(self) -> None:
         from unittest.mock import Mock
@@ -61,6 +81,23 @@ class BridgeClientTests(unittest.TestCase):
                 with self.assertRaises(ToolPolicyError):
                     runtime.run_capability("program-1", "rename_function", {"name": "renamed"})
         bridge.invoke.assert_not_called()
+
+    def test_runtime_accepts_a_backend_neutral_gateway_factory(self) -> None:
+        gateway = Mock()
+        gateway.invoke.return_value = {"name": "renamed"}
+        runtime = AgentRuntime(gateway_factory=lambda _program_id: gateway)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tools.json"
+            path.write_text('{"version": 2, "groups": {"program_write": true}, "tools": {}}')
+            with patch("aether_ghidra.config.tool_policy.TOOL_CONFIG_PATH", path):
+                result = runtime.run_capability(
+                    "program-1", "rename_function",
+                    {"address": {"space": "ram", "offset": "1000"}, "name": "renamed"},
+                )
+
+        self.assertEqual(result, {"name": "renamed"})
+        gateway.invoke.assert_called_once()
 
     def test_chat_job_cancellation_reaches_agent(self) -> None:
         started = threading.Event()
@@ -112,6 +149,12 @@ class BridgeClientTests(unittest.TestCase):
             release.set()
 
         self.assertEqual(state["progress"]["conversation_history"][0]["content"], "Inspect")
+
+    def test_missing_annotation_job_is_reported_as_lost(self) -> None:
+        state = AgentRuntime(Mock()).annotation_job("missing-job")
+
+        self.assertEqual(state["state"], "lost")
+        self.assertIn("restarted", state["error"])
 
 
 if __name__ == "__main__":
