@@ -38,6 +38,9 @@ public final class BridgeServer {
 			server = HttpServer.create(new InetSocketAddress("127.0.0.1", requestedPort), 0);
 			server.createContext("/health", this::handleHealth);
 			server.createContext("/v1/programs", this::handlePrograms);
+			server.createContext("/v1/project", this::handleProject);
+			server.createContext("/v1/programs/open", this::handleOpenProgram);
+			server.createContext("/v1/programs/close", this::handleCloseProgram);
 			server.createContext("/v1/invoke", this::handleInvoke);
 			server.createContext("/v1/import", this::handleImport);
 			server.setExecutor(Executors.newCachedThreadPool(runnable -> {
@@ -49,6 +52,50 @@ public final class BridgeServer {
 		}
 		catch (IOException e) {
 			throw new IllegalStateException("Could not start AETHER bridge on port " + requestedPort, e);
+		}
+	}
+
+	private void handleProject(HttpExchange exchange) throws IOException {
+		if (!method(exchange, "GET")) {
+			return;
+		}
+		Map<String, Object> result = new LinkedHashMap<>();
+		result.put("project", registry.projectMetadata());
+		writeJson(exchange, 200, result);
+	}
+
+	private void handleOpenProgram(HttpExchange exchange) throws IOException {
+		handleProgramLifecycle(exchange, true);
+	}
+
+	private void handleCloseProgram(HttpExchange exchange) throws IOException {
+		handleProgramLifecycle(exchange, false);
+	}
+
+	private void handleProgramLifecycle(HttpExchange exchange, boolean open) throws IOException {
+		if (!method(exchange, "POST")) {
+			return;
+		}
+		try {
+			Map<String, Object> request = Json.object(readJson(exchange));
+			Object requestVersion = request.get("protocol_version");
+			if (!(requestVersion instanceof Number number) || number.intValue() != PROTOCOL_VERSION) {
+				throw new ProgramRegistry.BridgeException("protocol_mismatch",
+					"Unsupported bridge protocol version: " + requestVersion);
+			}
+			String programId = Json.string(request, "program_id");
+			Map<String, Object> response = new LinkedHashMap<>();
+			response.put("ok", true);
+			response.put("protocol_version", PROTOCOL_VERSION);
+			response.put("result", open ? registry.openProgram(programId) : registry.closeProgram(programId));
+			writeJson(exchange, 200, response);
+		}
+		catch (ProgramRegistry.BridgeException error) {
+			writeError(exchange, 400, error.code(), error.getMessage());
+		}
+		catch (Exception error) {
+			Msg.error(this, "AETHER Program lifecycle request failed", error);
+			writeError(exchange, 500, "internal_error", error.getMessage());
 		}
 	}
 

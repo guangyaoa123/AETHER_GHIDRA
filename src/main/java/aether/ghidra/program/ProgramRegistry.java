@@ -26,13 +26,17 @@ import ghidra.app.services.ProgramManager;
 import ghidra.app.util.opinion.LoadResults;
 import ghidra.app.util.opinion.Loaded;
 import ghidra.framework.options.Options;
+import ghidra.framework.model.DomainFile;
+import ghidra.framework.model.DomainObject;
 import ghidra.framework.model.Project;
+import ghidra.framework.model.ProjectData;
 import ghidra.framework.plugintool.PluginTool;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSpace;
 import ghidra.program.model.address.AddressIterator;
 import ghidra.program.model.data.DataType;
 import ghidra.program.model.data.DataTypePath;
+import ghidra.program.model.listing.CircularDependencyException;
 import ghidra.program.model.listing.CodeUnit;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.Function.FunctionUpdateType;
@@ -59,6 +63,9 @@ import ghidra.program.model.symbol.Reference;
 import ghidra.program.model.symbol.ReferenceIterator;
 import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolIterator;
+import ghidra.program.util.GhidraProgramUtilities;
+import ghidra.util.exception.DuplicateNameException;
+import ghidra.util.exception.InvalidInputException;
 import ghidra.util.task.TaskMonitor;
 import ghidra.util.data.DataTypeParser;
 
@@ -69,16 +76,26 @@ import aether.ghidra.observability.DebugLog;
 public final class ProgramRegistry {
 	private final PluginTool tool;
 	private final ProgramManager programManager;
+	private final Project project;
+	private final ProjectData projectData;
 	private final Object lock = new Object();
 	private final Object importLock = new Object();
 	private final Map<String, ProgramContext> byId = new LinkedHashMap<>();
 	private final IdentityHashMap<Program, String> byProgram = new IdentityHashMap<>();
+	private final Set<Program> ownedPrograms = java.util.Collections.newSetFromMap(new IdentityHashMap<>());
+	private final ClassGraphRefresher classGraphRefresher = new ClassGraphRefresher();
+
+	/** Capabilities whose writes change data stored inside the class graph. */
+	private static final Set<String> GRAPH_AFFECTING_CAPABILITIES = Set.of(
+		"rename_function", "update_function_definition", "apply_annotation_batch");
 
 	public ProgramRegistry(PluginTool tool) {
 		if (tool == null) {
 			throw new IllegalStateException("PluginTool is required");
 		}
 		this.tool = tool;
+		this.project = tool.getProject();
+		this.projectData = project == null ? null : project.getProjectData();
 		this.programManager = tool.getService(ProgramManager.class);
 		if (programManager == null) {
 			throw new IllegalStateException("Ghidra ProgramManager service is unavailable");
@@ -87,11 +104,37 @@ public final class ProgramRegistry {
 
 	/** Creates a registry for one Program, used by headless Ghidra scripts. */
 	public ProgramRegistry(Program program) {
+		this(List.of(program));
+	}
+
+	/** Creates a registry for all Programs opened from one headless project. */
+	public ProgramRegistry(List<Program> programs) {
 		this.tool = null;
 		this.programManager = null;
-		if (program != null) {
-			register(program);
-			setActive(program);
+		this.project = null;
+		this.projectData = null;
+		if (programs != null) {
+			for (Program program : programs) {
+				register(program);
+			}
+			if (!programs.isEmpty()) {
+				setActive(programs.get(0));
+			}
+		}
+	}
+
+	/** Creates a registry backed by one live headless Ghidra Project. */
+	public ProgramRegistry(Project project, Program initialProgram) {
+		if (project == null) {
+			throw new IllegalStateException("Project is required");
+		}
+		this.tool = null;
+		this.programManager = null;
+		this.project = project;
+		this.projectData = project.getProjectData();
+		if (initialProgram != null) {
+			register(initialProgram);
+			setActive(initialProgram);
 		}
 	}
 
@@ -113,7 +156,11 @@ public final class ProgramRegistry {
 			if (byProgram.containsKey(program)) {
 				return;
 			}
-			String id = "program-" + UUID.randomUUID();
+			String id = programId(program);
+			ProgramContext existing = byId.get(id);
+			if (existing != null && existing.program() != program) {
+				throw new BridgeException("program_conflict", "Another Program is already open at " + id);
+			}
 			DebugLog.debug(this, "registered program_id=" + id);
 			byProgram.put(program, id);
 			byId.put(id, new ProgramContext(id, program));
@@ -156,6 +203,31 @@ public final class ProgramRegistry {
 
 	public List<Map<String, Object>> listPrograms() {
 		synchronized (lock) {
+			if (projectData != null) {
+				projectData.refresh(true);
+				List<Map<String, Object>> result = new ArrayList<>();
+				for (DomainFile file : projectData) {
+					if (!isProgram(file)) {
+						continue;
+					}
+					String id = normalizeProgramId(file.getPathname());
+					ProgramContext open = byId.get(id);
+					if (open != null) {
+						result.add(open.metadata());
+					}
+					else {
+						Map<String, Object> item = new LinkedHashMap<>();
+						item.put("program_id", id);
+						item.put("project_path", id);
+						item.put("name", file.getName());
+						item.put("state", "closed");
+						item.put("dirty", false);
+						item.put("active", false);
+						result.add(item);
+					}
+				}
+				return result;
+			}
 			List<Map<String, Object>> result = new ArrayList<>();
 			for (ProgramContext context : byId.values()) {
 				result.add(context.metadata());
@@ -164,20 +236,114 @@ public final class ProgramRegistry {
 		}
 	}
 
+	public Map<String, Object> projectMetadata() {
+		if (project == null) {
+			return Map.of("state", "unavailable");
+		}
+		Map<String, Object> result = new LinkedHashMap<>();
+		result.put("gpr_path", project.getProjectLocator().getMarkerFile().getAbsolutePath());
+		result.put("name", project.getName());
+		result.put("state", project.isClosed() ? "closed" : "open");
+		result.put("program_count", listPrograms().size());
+		synchronized (lock) {
+			result.put("open_program_count", byId.size());
+		}
+		return result;
+	}
+
+	public Map<String, Object> openProgram(String programId) {
+		String id = normalizeProgramId(programId);
+		synchronized (lock) {
+			ProgramContext existing = byId.get(id);
+			if (existing != null) {
+				return existing.metadata();
+			}
+		}
+		if (projectData == null) {
+			throw new BridgeException("project_unavailable", "The current backend cannot open stored Programs");
+		}
+		DomainFile file = projectData.getFile(id);
+		if (file == null || !isProgram(file)) {
+			throw new BridgeException("program_not_found", "Program does not exist in the project: " + id);
+		}
+		try {
+			DomainObject object = file.getDomainObject(this, true, true, TaskMonitor.DUMMY);
+			if (!(object instanceof Program program)) {
+				object.release(this);
+				throw new BridgeException("program_not_found", "Project item is not a Program: " + id);
+			}
+			if (programManager != null) {
+				programManager.openProgram(program, ProgramManager.OPEN_VISIBLE);
+				program.release(this);
+			}
+			else {
+				ownedPrograms.add(program);
+			}
+			register(program);
+			return metadataFor(id);
+		}
+		catch (BridgeException error) {
+			throw error;
+		}
+		catch (Exception error) {
+			throw new BridgeException("program_open_failed", "Could not open " + id + ": " + error.getMessage(), error);
+		}
+	}
+
+	public Map<String, Object> closeProgram(String programId) {
+		String id = normalizeProgramId(programId);
+		ProgramContext context;
+		synchronized (lock) {
+			context = byId.get(id);
+		}
+		if (context == null) {
+			throw new BridgeException("program_not_open", "Program is not open: " + id);
+		}
+		synchronized (context) {
+			Program program = context.program();
+			Map<String, Object> saved = saveProgram(program);
+			if (programManager != null) {
+				if (!programManager.closeProgram(program, false)) {
+					throw new BridgeException("program_close_failed", "Ghidra refused to close " + id);
+				}
+			}
+			else if (ownedPrograms.remove(program)) {
+				program.release(this);
+			}
+			unregister(program);
+			return Map.of("program_id", id, "closed", true, "saved", saved.get("saved"));
+		}
+	}
+
+	private static boolean isProgram(DomainFile file) {
+		Class<? extends DomainObject> type = file.getDomainObjectClass();
+		return type != null && Program.class.isAssignableFrom(type);
+	}
+
+	private static String programId(Program program) {
+		DomainFile file = program.getDomainFile();
+		return normalizeProgramId(file == null ? program.getName() : file.getPathname());
+	}
+
+	private static String normalizeProgramId(String value) {
+		if (value == null || value.isBlank()) {
+			throw new BridgeException("invalid_identity", "program_id is required");
+		}
+		String normalized = value.trim().replace('\\', '/');
+		return normalized.startsWith("/") ? normalized : "/" + normalized;
+	}
+
 	/** Imports one or more Programs into the interactive tool project. */
 	public Map<String, Object> importProgram(File source) {
-		if (tool == null || programManager == null) {
-			throw new BridgeException("interactive_import_unsupported",
-				"Interactive imports require a ProgramRegistry created with a PluginTool");
+		if (project == null) {
+			throw new BridgeException("project_unavailable", "Imports require an open Ghidra Project");
 		}
 		if (source == null || !source.isFile()) {
 			throw new BridgeException("invalid_argument",
 				"Import source must exist and be a regular file: " + source);
 		}
-		Project project = tool.getProject();
 		if (project == null || project.isClosed()) {
-			throw new BridgeException("project_unavailable",
-				"Interactive imports require an open Ghidra project");
+			throw new BridgeException("project_unavailable", "Imports require an open Ghidra project");
 		}
 
 		synchronized (importLock) {
@@ -197,10 +363,15 @@ public final class ProgramRegistry {
 
 					for (int index = 0; index < loadedPrograms.size(); index++) {
 						Program program = loadedPrograms.get(index);
-						programManager.openProgram(program,
-							index == 0 ? ProgramManager.OPEN_CURRENT : ProgramManager.OPEN_VISIBLE);
+						if (programManager != null) {
+							programManager.openProgram(program,
+								index == 0 ? ProgramManager.OPEN_CURRENT : ProgramManager.OPEN_VISIBLE);
+						}
+						else {
+							ownedPrograms.add(program);
+						}
 						register(program);
-						RttiRecoveryRunner.run(tool, program, TaskMonitor.DUMMY);
+						startAnalysis(program);
 					}
 
 					List<Map<String, Object>> programs = new ArrayList<>();
@@ -219,7 +390,7 @@ public final class ProgramRegistry {
 				finally {
 					// ProgramManager owns opened Programs; release only this temporary consumer.
 					for (Program program : loadedPrograms) {
-						if (!program.isClosed() && program.isUsedBy(this)) {
+						if (programManager != null && !program.isClosed() && program.isUsedBy(this)) {
 							program.release(this);
 						}
 					}
@@ -232,6 +403,45 @@ public final class ProgramRegistry {
 				throw new BridgeException("import_failed",
 					"Could not import " + source + ": " + e.getMessage(), e);
 			}
+		}
+	}
+
+	private void startAnalysis(Program program) {
+		setRecoveryState(program, "running");
+		Thread worker = new Thread(() -> {
+			try {
+				int transaction = program.startTransaction("AETHER: auto-analyze imported program");
+				boolean commit = false;
+				try {
+					AutoAnalysisManager manager = AutoAnalysisManager.getAnalysisManager(program);
+					manager.initializeOptions();
+					manager.reAnalyzeAll(program.getMemory());
+					manager.startAnalysis(TaskMonitor.DUMMY);
+					GhidraProgramUtilities.markProgramAnalyzed(program);
+					commit = true;
+				}
+				finally {
+					program.endTransaction(transaction, commit);
+				}
+				RttiRecoveryRunner.run(project, program, TaskMonitor.DUMMY);
+				saveProgram(program);
+			}
+			catch (Exception error) {
+				setRecoveryState(program, "failed");
+				DebugLog.debug(this, "import analysis failed: " + error.getMessage());
+			}
+		}, "aether-import-analysis");
+		worker.setDaemon(true);
+		worker.start();
+	}
+
+	private static void setRecoveryState(Program program, String state) {
+		int transaction = program.startTransaction("AETHER: update recovery state");
+		try {
+			program.getOptions("AETHER").setString("rtti_import_recovery_state", state);
+		}
+		finally {
+			program.endTransaction(transaction, true);
 		}
 	}
 
@@ -256,7 +466,7 @@ public final class ProgramRegistry {
 		// A per-program monitor prevents concurrent writes to one Program while allowing
 		// requests for different open binaries to proceed independently.
 			synchronized (context) {
-			return switch (capability) {
+			Object result = switch (capability) {				case "save_program" -> saveProgram(context.program());
 				case "get_program_metadata" -> context.metadata();
 				case "get_analysis_status" -> getAnalysisStatus(context.program(), programId);
 				case "list_functions" -> listFunctions(context.program(), arguments);
@@ -281,17 +491,35 @@ public final class ProgramRegistry {
 				default -> throw new BridgeException(
 					"capability_unsupported", "Unsupported capability: " + capability);
 			};
+			if (GRAPH_AFFECTING_CAPABILITIES.contains(capability)) {
+				// Function renames and signature updates are frozen into the stored
+				// class graph (vtable slot contents); recompute it in the background.
+				classGraphRefresher.schedule(context.program(), null);
+			}
+			@SuppressWarnings("unchecked")
+			Map<String, Object> typedResult = (Map<String, Object>) result;
+			return typedResult;
 		}
+	}
+
+	/**
+	 * Schedules a debounced class-graph recompute for the given Program. Used by
+	 * the GUI plugin for change events; write capabilities schedule internally.
+	 */
+	public void scheduleClassGraphRefresh(Program program, Runnable onComplete) {
+		classGraphRefresher.schedule(program, onComplete);
 	}
 
 	private Map<String, Object> getAnalysisStatus(Program program, String programId) {
 		boolean isAnalyzing = AutoAnalysisManager.getAnalysisManager(program).isAnalyzing();
+		boolean isAnalyzed = GhidraProgramUtilities.isAnalyzed(program);
 		Map<String, Object> result = new LinkedHashMap<>();
 		if (programId != null) {
 			result.put("program_id", programId);
 		}
-		result.put("state", isAnalyzing ? "running" : "completed");
+		result.put("state", isAnalyzing ? "running" : isAnalyzed ? "completed" : "not_analyzed");
 		result.put("is_analyzing", isAnalyzing);
+		result.put("analyzed", isAnalyzed);
 		result.put("analysis_job_id", programId == null ? null : "analysis-job-" + programId);
 		Options aetherOptions = program.getOptions("AETHER");
 		String rttiRecoveryState = aetherOptions.getString("rtti_import_recovery_state", null);
@@ -302,10 +530,47 @@ public final class ProgramRegistry {
 	}
 
 	public void close() {
-		// No Program is owned by this registry; Ghidra's ProgramManager remains authoritative.
+		// No Program is owned by this registry; save before dropping its identities.
+		List<Program> programs;
+		synchronized (lock) {
+			programs = byId.values().stream().map(ProgramContext::program).toList();
+		}
+		for (Program program : programs) {
+			try {
+				saveProgram(program);
+			}
+			catch (RuntimeException error) {
+				DebugLog.debug(this, "could not save Program during registry close: " + error.getMessage());
+			}
+		}
+		for (Program program : List.copyOf(ownedPrograms)) {
+			if (!program.isClosed() && program.isUsedBy(this)) {
+				program.release(this);
+			}
+		}
+		ownedPrograms.clear();
+		classGraphRefresher.shutdown();
 		synchronized (lock) {
 			byId.clear();
 			byProgram.clear();
+		}
+	}
+
+	private static Map<String, Object> saveProgram(Program program) {
+		try {
+			if (program.isChanged()) {
+				if (!program.canSave()) {
+					throw new BridgeException("save_failed", "Modified Program cannot be saved: " + program.getName());
+				}
+				program.save("AETHER automatic session save", TaskMonitor.DUMMY);
+			}
+			if (program.isChanged()) {
+				throw new BridgeException("save_failed", "Program remains modified after save: " + program.getName());
+			}
+			return Map.of("saved", true, "dirty", false);
+		}
+		catch (Exception error) {
+			throw new BridgeException("save_failed", "Could not save Program: " + error.getMessage(), error);
 		}
 	}
 
@@ -1504,6 +1769,13 @@ public final class ProgramRegistry {
 		return locationArgument(program, Map.of("address", value));
 	}
 
+	/**
+	 * Renames the exact function. A name containing "::" is split on the last
+	 * "::": the prefix becomes a hierarchically resolved or created namespace
+	 * path ("Sexy::Fish::update" places `update` in namespace Sexy::Fish) and
+	 * the suffix becomes the function name. A plain name keeps the current
+	 * parent namespace.
+	 */
 	private Map<String, Object> renameFunction(Program program, Map<String, Object> arguments)
 		throws Exception {
 		String name = Json.string(arguments, "name");
@@ -1511,16 +1783,78 @@ public final class ProgramRegistry {
 			throw new BridgeException("invalid_argument", "name must not be blank");
 		}
 		Function function = functionAt(program, arguments);
+		String delimiter = Namespace.NAMESPACE_DELIMITER;
+		int separator = name.lastIndexOf(delimiter);
 		int transaction = program.startTransaction("AETHER: rename function");
 		boolean commit = false;
 		try {
-			function.setName(name, SourceType.USER_DEFINED);
+			if (separator < 0) {
+				function.setName(name, SourceType.USER_DEFINED);
+				commit = true;
+				return functionMap(function);
+			}
+			String namespacePath = name.substring(0, separator);
+			String baseName = name.substring(separator + delimiter.length());
+			if (baseName.isBlank()) {
+				throw new BridgeException("invalid_argument",
+					"Function name must be '<namespace>::<name>' with a non-empty base name: " + name);
+			}
+			Namespace target = resolveNamespaceHierarchy(program, namespacePath);
+			if (target == null) {
+				throw new BridgeException("invalid_argument",
+					"Namespace components must be non-empty: " + name);
+			}
+			function.setName(baseName, SourceType.USER_DEFINED);
+			if (!function.getParentNamespace().equals(target)) {
+				try {
+					function.getSymbol().setNamespace(target);
+				}
+				catch (DuplicateNameException error) {
+					throw new BridgeException("already_exists",
+						"A symbol named '" + baseName + "' already exists in namespace '"
+							+ target.getName(true) + "'", error);
+				}
+				catch (InvalidInputException | CircularDependencyException error) {
+					throw new BridgeException("namespace_failed",
+						"Could not move function into namespace '" + target.getName(true)
+							+ "': " + error.getMessage(), error);
+				}
+			}
 			commit = true;
 			return functionMap(function);
 		}
 		finally {
 			program.endTransaction(transaction, commit);
 		}
+	}
+
+	/** Resolves or creates a "::"-separated namespace path under the global namespace. */
+	private Namespace resolveNamespaceHierarchy(Program program, String namespacePath) {
+		String delimiter = Namespace.NAMESPACE_DELIMITER;
+		Namespace current = program.getGlobalNamespace();
+		// Limit -1 keeps trailing empty components, so "A::" is rejected too.
+		for (String component : namespacePath.split(java.util.regex.Pattern.quote(delimiter), -1)) {
+			if (component.isBlank()) {
+				return null;
+			}
+			Namespace child = program.getSymbolTable().getNamespace(component, current);
+			if (child == null) {
+				try {
+					child = program.getSymbolTable().getOrCreateNameSpace(
+						current, component, SourceType.USER_DEFINED);
+				}
+				catch (InvalidInputException error) {
+					throw new BridgeException("namespace_failed",
+						"Invalid namespace component '" + component + "': " + error.getMessage(), error);
+				}
+				catch (Exception error) {
+					throw new BridgeException("namespace_failed",
+						"Could not create namespace '" + component + "': " + error.getMessage(), error);
+				}
+			}
+			current = child;
+		}
+		return current;
 	}
 
 	private Map<String, Object> setFunctionComment(Program program, Map<String, Object> arguments) {

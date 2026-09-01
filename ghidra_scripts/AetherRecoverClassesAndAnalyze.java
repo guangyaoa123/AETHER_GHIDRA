@@ -5,7 +5,7 @@ import ghidra.program.util.GhidraProgramUtilities;
 
 import aether.ghidra.program.AetherRttiInheritanceAnalyzer;
 
-/** Runs Ghidra class recovery followed by the AETHER RTTI inheritance analyzer. */
+/** Runs Ghidra class recovery followed by the AETHER RTTI analyzer. */
 public class AetherRecoverClassesAndAnalyze extends GhidraScript {
     @Override
     public void run() throws Exception {

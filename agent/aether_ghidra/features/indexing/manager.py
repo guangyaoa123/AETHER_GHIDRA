@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
+import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +30,40 @@ class FunctionIndexManager:
     @classmethod
     def path(cls, stable_id: str) -> Path:
         return Path.home() / ".config" / "aether-ghidra" / "indexes" / stable_id / "index.json"
+
+    @classmethod
+    def job_path(cls, stable_id: str) -> Path:
+        return cls.path(stable_id).with_name("job.json")
+
+    @classmethod
+    def save_job(cls, stable_id: str, payload: dict[str, object]) -> None:
+        path = cls.job_path(stable_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = json.dumps({**payload, "updated_at": int(time.time() * 1000)}, indent=2)
+        fd, temporary = tempfile.mkstemp(prefix="job-", suffix=".tmp", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(data)
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    @classmethod
+    def load_job(cls, job_id: str) -> dict[str, object] | None:
+        root = Path.home() / ".config" / "aether-ghidra" / "indexes"
+        try:
+            paths = root.glob("*/job.json")
+        except OSError:
+            return None
+        for path in paths:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, OSError, json.JSONDecodeError):
+                continue
+            if isinstance(payload, dict) and str(payload.get("job_id", "")) == job_id:
+                return payload
+        return None
 
     @classmethod
     def get(cls, metadata: dict[str, Any]) -> FunctionIndex:

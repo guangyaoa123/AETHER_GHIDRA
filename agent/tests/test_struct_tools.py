@@ -119,6 +119,24 @@ class StructToolTests(unittest.TestCase):
         ]})["bases"]
         self.assertEqual(bases, [{"class_id": "class-base", "structure": "/Types/Base"}])
 
+    def test_bare_leading_slash_type_names_are_normalized(self) -> None:
+        fields = normalize_bridge_arguments("update_fields", {"structure_path": "/T/S", "fields": [
+            {"offset": 0, "data_type_path": "/undefined4"},
+            {"offset": 4, "data_type_path": "/undefined4 *"},
+            {"offset": 8, "data_type_path": "/ClassDataTypes/Board/Board"},
+            {"offset": 12, "data_type_path": "int"},
+        ]})["fields"]
+        self.assertEqual(fields[0]["data_type"], "undefined4")
+        self.assertEqual(fields[1]["data_type"], "undefined4 *")
+        self.assertEqual(fields[2]["data_type"], "/ClassDataTypes/Board/Board")
+        self.assertEqual(fields[3]["data_type"], "int")
+
+        retype = normalize_bridge_arguments("retype_variable", {
+            "address": {"space": "ram", "offset": "1000"},
+            "variable_name": "value", "data_type_path": "/int",
+        })
+        self.assertEqual(retype["data_type"], "int")
+
     def test_list_functions_returns_only_address_and_definition(self) -> None:
         rendered = ChatbotToolbox(None, FunctionListBridge()).list_functions()
         result = json.loads(rendered)

@@ -2,6 +2,7 @@ package aether.ghidra.program;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -20,6 +21,7 @@ import ghidra.program.model.data.DataTypeManager;
 import ghidra.program.model.data.DataTypePath;
 import ghidra.program.model.data.Structure;
 import ghidra.program.model.data.StructureDataType;
+import ghidra.program.model.data.Undefined1DataType;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.listing.Data;
 import ghidra.program.model.listing.Function;
@@ -78,6 +80,7 @@ final class StructureManager {
 			throw invalid("limit must be between 1 and 1000");
 		}
 		Map<String, Map<String, Object>> models = allClassModels(program);
+		QueryContext context = QueryContext.of(program);
 		List<Structure> structures = new ArrayList<>();
 		Iterator<Structure> iterator = program.getDataTypeManager().getAllStructures();
 		while (iterator.hasNext()) {
@@ -86,7 +89,7 @@ final class StructureManager {
 		structures.sort(Comparator.comparing(DataType::getPathName));
 		List<Map<String, Object>> result = new ArrayList<>();
 		for (Structure structure : structures) {
-			Map<String, Object> item = structureSummary(program, structure, models);
+			Map<String, Object> item = structureSummary(context, program, structure, models);
 			if (kind != null && !kind.equals(item.get("kind"))) {
 				continue;
 			}
@@ -111,7 +114,8 @@ final class StructureManager {
 	private static Map<String, Object> getStruct(Program program, Map<String, Object> arguments) {
 		Structure structure = resolveStructure(program, arguments);
 		Map<String, Map<String, Object>> models = allClassModels(program);
-		Map<String, Object> result = structureSummary(program, structure, models);
+		QueryContext context = QueryContext.of(program);
+		Map<String, Object> result = structureSummary(context, program, structure, models);
 		List<Map<String, Object>> fields = new ArrayList<>();
 		for (DataTypeComponent component : structure.getDefinedComponents()) {
 			Map<String, Object> field = new LinkedHashMap<>();
@@ -125,9 +129,9 @@ final class StructureManager {
 			fields.add(field);
 		}
 		result.put("fields", fields);
-		Map<String, Object> model = classModelFor(program, structure, models);
+		Map<String, Object> model = classModelFor(context, program, structure, models);
 		if (model != null) {
-			result.put("class", classDetails(program, structure, model, models));
+			result.put("class", classDetails(context, program, structure, model, models));
 		}
 		return result;
 	}
@@ -163,113 +167,287 @@ final class StructureManager {
 		return getStruct(program, Map.of("path", category.getPath() + "/" + name));
 	}
 
+	/**
+	 * Inserts fields at byte offsets. Insertion shifts fields at or after the
+	 * offset up and grows the structure by the inserted length. Batch entries
+	 * are applied in descending offset order so every offset refers to the
+	 * original layout.
+	 */
 	private static Map<String, Object> addFields(Program program, Map<String, Object> arguments) {
 		Structure structure = resolveStructure(program, arguments);
 		List<Map<String, Object>> fields = fields(arguments);
 		if (fields.isEmpty()) {
 			throw invalid("fields must not be empty");
 		}
+		List<Map<String, Object>> ordered = new ArrayList<>(fields);
+		ordered.sort(Comparator.<Map<String, Object>>comparingInt(
+			field -> integer(field, "offset", -1)).reversed());
+		Set<Integer> seenOffsets = new HashSet<>();
+		for (Map<String, Object> field : ordered) {
+			if (integer(field, "offset", -1) < 0) {
+				throw invalid("Fields require non-negative offsets");
+			}
+			if (!seenOffsets.add(integer(field, "offset", -1))) {
+				throw invalid("add_fields entries must have unique offsets");
+			}
+		}
+		int sizeBefore = structure.getLength();
+		List<Map<String, Object>> changed = new ArrayList<>();
 		int transaction = program.startTransaction("AETHER: add structure fields");
 		boolean commit = false;
 		try {
-			validateNewFields(program, structure, fields, Set.of());
-			applyAddedFields(program, structure, fields);
+			try {
+				for (Map<String, Object> field : ordered) {
+					DataType type = parseDataType(program, required(field, "data_type"));
+					int offset = integer(field, "offset", -1);
+					int length = integer(field, "length", type.getLength());
+					if (length <= 0) {
+						throw invalid("Fields require positive lengths");
+					}
+					DataTypeComponent containing = containingComponent(structure, offset);
+					if (containing != null) {
+						throw new ProgramRegistry.BridgeException("structure_conflict",
+							"Offset 0x" + Integer.toHexString(offset) + " falls inside field '"
+								+ containing.getFieldName() + "' starting at offset 0x"
+								+ Integer.toHexString(containing.getOffset())
+								+ "; add_fields requires a field boundary");
+					}
+					String name = optionalString(field, "name");
+					structure.insertAtOffset(offset, type, length, name, optionalString(field, "comment"));
+					changed.add(changedEntry("inserted", name, offset, null, length));
+				}
+			}
+			catch (IllegalArgumentException error) {
+				throw new ProgramRegistry.BridgeException("structure_conflict",
+					"Cannot insert field: " + error.getMessage()
+						+ ". add_fields shifts fields at or after the offset; the offset must land on a field boundary",
+					error);
+			}
 			commit = true;
 		}
 		finally {
 			program.endTransaction(transaction, commit);
 		}
-		return getStruct(program, Map.of("path", structure.getPathName()));
+		return compactResult(structure, sizeBefore, changed, embeddedSizeWarnings(program, structure));
 	}
 
+	/**
+	 * Updates fields in place without ever changing the structure size. An
+	 * offset holding a defined field replaces it in place (consuming adjacent
+	 * undefined bytes only); an offset inside a field is rejected; an offset in
+	 * a gap defines a new field there, replacing any field it overlaps and
+	 * reporting it under "replaced".
+	 */
 	private static Map<String, Object> updateFields(Program program, Map<String, Object> arguments) {
 		Structure structure = resolveStructure(program, arguments);
 		List<Map<String, Object>> fields = fields(arguments);
 		if (fields.isEmpty()) {
 			throw invalid("fields must not be empty");
 		}
+		List<Map<String, Object>> ordered = new ArrayList<>(fields);
+		ordered.sort(Comparator.comparingInt(field -> integer(field, "offset", -1)));
+		Set<Integer> seenOffsets = new HashSet<>();
+		for (Map<String, Object> field : ordered) {
+			if (integer(field, "offset", -1) < 0) {
+				throw invalid("Fields require non-negative offsets");
+			}
+			if (!seenOffsets.add(integer(field, "offset", -1))) {
+				throw invalid("Each updated field must have a unique offset");
+			}
+		}
+		int sizeBefore = structure.getLength();
+		List<Map<String, Object>> changed = new ArrayList<>();
+		List<Map<String, Object>> replaced = new ArrayList<>();
 		int transaction = program.startTransaction("AETHER: update structure fields");
 		boolean commit = false;
 		try {
-			Set<Integer> updatedOffsets = new HashSet<>();
-			for (Map<String, Object> field : fields) {
-				int offset = integer(field, "offset", -1);
-				if (offset < 0 || !updatedOffsets.add(offset)) {
-					throw invalid("Each updated field must have a unique non-negative offset");
-				}
-				DataTypeComponent component = definedComponentAt(structure, offset);
-				if (component == null) {
-					continue;
-				}
-				if (field.containsKey("data_type") || field.containsKey("length")) {
-					DataType type = field.containsKey("data_type")
-						? parseDataType(program, required(field, "data_type")) : component.getDataType();
-					int length = integer(field, "length", component.getLength());
-					validateReplacement(structure, component, offset, length);
-					structure.replaceAtOffset(offset, type, length,
-						optionalString(field, "name", component.getFieldName()),
-						optionalString(field, "comment", component.getComment()));
-				}
-				else {
-					String name = optionalString(field, "name");
-					String comment = optionalString(field, "comment");
-					if (name != null) {
-						component.setFieldName(name);
-					}
-					if (comment != null) {
-						component.setComment(comment);
-					}
-				}
+			for (Map<String, Object> field : ordered) {
+				applyFieldUpdate(program, structure, field, changed, replaced);
 			}
-			List<Map<String, Object>> missing = new ArrayList<>();
-			for (Map<String, Object> field : fields) {
-				int offset = integer(field, "offset", -1);
-				if (definedComponentAt(structure, offset) == null) {
-					missing.add(field);
-				}
-			}
-			validateNewFields(program, structure, missing, updatedOffsets);
-			applyAddedFields(program, structure, missing);
 			commit = true;
 		}
 		finally {
 			program.endTransaction(transaction, commit);
 		}
-		return getStruct(program, Map.of("path", structure.getPathName()));
+		Map<String, Object> result = compactResult(structure, sizeBefore, changed, null);
+		if (!replaced.isEmpty()) {
+			result.put("replaced", replaced);
+		}
+		return result;
 	}
 
+	private static void applyFieldUpdate(Program program, Structure structure, Map<String, Object> field,
+		List<Map<String, Object>> changed, List<Map<String, Object>> replaced) {
+		int offset = integer(field, "offset", -1);
+		boolean hasType = field.containsKey("data_type") || field.containsKey("length");
+		DataTypeComponent component = definedComponentAt(structure, offset);
+		if (component != null && component.getOffset() == offset) {
+			if (!hasType) {
+				String name = optionalString(field, "name");
+				String comment = optionalString(field, "comment");
+				if (name != null) {
+					component.setFieldName(name);
+				}
+				if (comment != null) {
+					component.setComment(comment);
+				}
+				changed.add(changedEntry(name == null ? "commented" : "renamed",
+					name == null ? component.getFieldName() : name, offset, component.getOrdinal(),
+					component.getLength()));
+				return;
+			}
+		DataType type = field.containsKey("data_type")
+			? parseDataType(program, required(field, "data_type")) : component.getDataType();
+		int length = integer(field, "length",
+			field.containsKey("data_type") ? type.getLength() : component.getLength());
+		if (length <= 0) {
+			throw invalid("Field length must be positive");
+		}
+		int available = availableBytes(structure, offset);
+			if (length > available) {
+				throw new ProgramRegistry.BridgeException("structure_conflict",
+					"Replacement at offset 0x" + Integer.toHexString(offset) + " needs " + length
+						+ " bytes but only " + available + " are available before the next field or structure"
+						+ " end; update_fields never changes the structure size");
+			}
+			validateReplacement(structure, component, offset, length);
+			structure.replaceAtOffset(offset, type, length,
+				optionalString(field, "name", component.getFieldName()),
+				optionalString(field, "comment", component.getComment()));
+			changed.add(changedEntry("replaced", optionalString(field, "name", component.getFieldName()),
+				offset, null, length));
+			return;
+		}
+		if (component != null) {
+			throw new ProgramRegistry.BridgeException("structure_conflict",
+				"Offset 0x" + Integer.toHexString(offset) + " falls inside field '" + component.getFieldName()
+					+ "' starting at offset 0x" + Integer.toHexString(component.getOffset())
+					+ "; use the field's start offset to update it");
+		}
+		if (!field.containsKey("data_type")) {
+			throw invalid("No defined field at offset 0x" + Integer.toHexString(offset)
+				+ "; provide data_type to define one there (update_fields never changes the structure size)");
+		}
+		DataType type = parseDataType(program, required(field, "data_type"));
+		int length = integer(field, "length", type.getLength());
+		if (length <= 0) {
+			throw invalid("Field length must be positive");
+		}
+		if (offset + length > structure.getLength()) {
+			throw new ProgramRegistry.BridgeException("structure_conflict",
+				"Field at offset 0x" + Integer.toHexString(offset) + " with length " + length
+					+ " would extend past the structure end; update_fields never changes the structure size");
+		}
+		List<DataTypeComponent> overlaps = overlappingComponents(structure, offset, length);
+		for (DataTypeComponent overlap : overlaps) {
+			replaced.add(componentInfo(overlap));
+		}
+		// Neutralize each overlapping field in place (same footprint, undefined
+		// content) so the layout never shifts and the size never changes.
+		for (DataTypeComponent overlap : overlaps) {
+			structure.replaceAtOffset(overlap.getOffset(), new Undefined1DataType(),
+				overlap.getLength(), null, null);
+		}
+		try {
+			structure.replaceAtOffset(offset, type, length,
+				optionalString(field, "name"), optionalString(field, "comment"));
+		}
+		catch (IllegalArgumentException error) {
+			throw new ProgramRegistry.BridgeException("structure_conflict",
+				"Cannot define field at offset 0x" + Integer.toHexString(offset) + ": " + error.getMessage()
+					+ "; update_fields never changes the structure size", error);
+		}
+		changed.add(changedEntry(overlaps.isEmpty() ? "defined" : "replaced",
+			optionalString(field, "name"), offset, null, length));
+	}
+
+	/**
+	 * Removes fields by byte offset (default) or by ordinal with by_ordinal=true.
+	 * Each removal shifts following fields down and shrinks the structure by the
+	 * removed field's length (Ghidra deleteAtOffset semantics); targets are
+	 * processed in descending offset order so every coordinate refers to the
+	 * original layout.
+	 */
 	private static Map<String, Object> removeFields(Program program, Map<String, Object> arguments) {
 		Structure structure = resolveStructure(program, arguments);
-		List<Integer> offsets = new ArrayList<>();
-		Object rawOffsets = arguments.get("offsets");
-		if (rawOffsets instanceof List<?> list) {
+		boolean byOrdinal = Boolean.TRUE.equals(arguments.get("by_ordinal"));
+		List<Integer> coordinates = new ArrayList<>();
+		Object rawCoordinates = arguments.get("offsets");
+		if (rawCoordinates instanceof List<?> list) {
 			for (Object value : list) {
-				offsets.add(asInteger(value, "offset"));
+				coordinates.add(asInteger(value, "offset"));
 			}
 		}
 		for (Map<String, Object> field : fields(arguments)) {
-			offsets.add(integer(field, "offset", -1));
+			coordinates.add(integer(field, "offset", -1));
 		}
-		if (offsets.isEmpty() || offsets.stream().anyMatch(offset -> offset < 0)) {
-			throw invalid("offsets or fields with offsets are required");
+		if (coordinates.isEmpty() || coordinates.stream().anyMatch(value -> value < 0)) {
+			throw invalid(byOrdinal
+				? "ordinals (via offsets or fields) are required and must be non-negative"
+				: "offsets or fields with offsets are required");
 		}
+		int sizeBefore = structure.getLength();
+		List<Map<String, Object>> changed = new ArrayList<>();
+		List<Integer> targetOffsets = new ArrayList<>();
+		Set<Integer> seenCoordinates = new HashSet<>();
+		for (int coordinate : coordinates) {
+			if (!seenCoordinates.add(coordinate)) {
+				continue;
+			}
+			DataTypeComponent target = byOrdinal
+				? structure.getComponent(coordinate) : definedComponentAt(structure, coordinate);
+			if (target == null || definedComponentAt(structure, target.getOffset()) != target) {
+				throw byOrdinal ? undefinedOrdinalError(structure, coordinate)
+					: undefinedFieldError(structure, coordinate);
+			}
+			targetOffsets.add(target.getOffset());
+		}
+		targetOffsets.sort(Comparator.reverseOrder());
 		int transaction = program.startTransaction("AETHER: remove structure fields");
 		boolean commit = false;
 		try {
-			for (int offset : offsets) {
-				if (definedComponentAt(structure, offset) == null) {
-					throw new ProgramRegistry.BridgeException("not_found", "No defined field at offset 0x" + Integer.toHexString(offset));
+			for (int targetOffset : targetOffsets) {
+				DataTypeComponent target = definedComponentAt(structure, targetOffset);
+				if (target == null) {
+					throw undefinedFieldError(structure, targetOffset);
 				}
-			}
-			for (int offset : offsets) {
-				structure.deleteAtOffset(offset);
+				changed.add(changedEntry("removed", target.getFieldName(), target.getOffset(),
+					target.getOrdinal(), target.getLength()));
+				structure.deleteAtOffset(target.getOffset());
 			}
 			commit = true;
 		}
 		finally {
 			program.endTransaction(transaction, commit);
 		}
-		return getStruct(program, Map.of("path", structure.getPathName()));
+		return compactResult(structure, sizeBefore, changed, embeddedSizeWarnings(program, structure));
+	}
+
+	private static ProgramRegistry.BridgeException undefinedFieldError(Structure structure, int offset) {
+		DataTypeComponent nearest = null;
+		for (DataTypeComponent component : structure.getDefinedComponents()) {
+			if (nearest == null ||
+				Math.abs(component.getOffset() - offset) < Math.abs(nearest.getOffset() - offset)) {
+				nearest = component;
+			}
+		}
+		String context = nearest == null ? "the structure has no defined fields"
+			: "nearest field: ordinal " + nearest.getOrdinal() + " '" + nearest.getFieldName()
+				+ "' at offset 0x" + Integer.toHexString(nearest.getOffset());
+		return new ProgramRegistry.BridgeException("not_found",
+			"No defined field at offset 0x" + Integer.toHexString(offset) + " (" + context + ")");
+	}
+
+	private static ProgramRegistry.BridgeException undefinedOrdinalError(Structure structure, int ordinal) {
+		DataTypeComponent component = structure.getComponent(ordinal);
+		if (component == null) {
+			return new ProgramRegistry.BridgeException("not_found",
+				"No component with ordinal " + ordinal + " (structure has "
+					+ structure.getNumComponents() + " components)");
+		}
+		return new ProgramRegistry.BridgeException("not_found",
+			"Component with ordinal " + ordinal + " is undefined padding at offset 0x"
+				+ Integer.toHexString(component.getOffset()) + "; only defined fields can be removed");
 	}
 
 	private static Map<String, Object> resizeStruct(Program program, Map<String, Object> arguments) {
@@ -278,6 +456,7 @@ final class StructureManager {
 		if (length < 0) {
 			throw invalid("size or length must be a non-negative integer");
 		}
+		int sizeBefore = structure.getLength();
 		if (length < structure.getLength()) {
 			for (DataTypeComponent component : structure.getDefinedComponents()) {
 				if (component.getEndOffset() >= length) {
@@ -294,7 +473,7 @@ final class StructureManager {
 		finally {
 			program.endTransaction(transaction, commit);
 		}
-		return getStruct(program, Map.of("path", structure.getPathName()));
+		return compactResult(structure, sizeBefore, List.of(), embeddedSizeWarnings(program, structure));
 	}
 
 	private static Map<String, Object> createClass(Program program, Map<String, Object> arguments) {
@@ -407,10 +586,10 @@ final class StructureManager {
 		return result;
 	}
 
-	private static Map<String, Object> structureSummary(Program program, Structure structure,
+	private static Map<String, Object> structureSummary(QueryContext context, Program program, Structure structure,
 		Map<String, Map<String, Object>> models) {
 		Map<String, Object> result = new LinkedHashMap<>();
-		Map<String, Object> model = classModelFor(program, structure, models);
+		Map<String, Object> model = classModelFor(context, program, structure, models);
 		result.put("name", structure.getName());
 		result.put("path", structure.getPathName());
 		result.put("category", structure.getCategoryPath().getPath());
@@ -424,7 +603,7 @@ final class StructureManager {
 			result.put("bases", model.getOrDefault("bases", List.of()));
 			result.put("vtable_count", listValue(model.get("vtables")).size());
 			result.put("rtti_available", model.get("rtti") != null);
-			result.put("group_structures", groupStructures(program, structure, model));
+			result.put("group_structures", groupStructures(context, program, structure, model));
 		}
 		else {
 			result.put("class_name", null);
@@ -434,11 +613,11 @@ final class StructureManager {
 		return result;
 	}
 
-	private static Map<String, Object> classDetails(Program program, Structure structure,
+	private static Map<String, Object> classDetails(QueryContext context, Program program, Structure structure,
 		Map<String, Object> model,
 		Map<String, Map<String, Object>> models) {
 		Map<String, Object> result = new LinkedHashMap<>(model);
-		result.put("group_structures", groupStructures(program, structure, model));
+		result.put("group_structures", groupStructures(context, program, structure, model));
 		List<Map<String, Object>> bases = new ArrayList<>();
 		for (Object raw : listValue(model.get("bases"))) {
 			if (raw instanceof Map<?, ?> rawMap) {
@@ -535,8 +714,8 @@ final class StructureManager {
 		return target == null ? function.getEntryPoint() : target.getEntryPoint();
 	}
 
-	private static List<Map<String, Object>> groupStructures(Program program, Structure dataStructure,
-		Map<String, Object> model) {
+	private static List<Map<String, Object>> groupStructures(QueryContext context, Program program,
+		Structure dataStructure, Map<String, Object> model) {
 		List<Map<String, Object>> result = new ArrayList<>();
 		Set<String> paths = new HashSet<>();
 		Map<String, Object> vtableAddresses = new LinkedHashMap<>();
@@ -545,17 +724,15 @@ final class StructureManager {
 				continue;
 			}
 			Map<String, Object> vtable = Json.object(rawMap);
-			Structure vtableStructure = findVtableStructure(program, String.valueOf(vtable.get("name")));
+			Structure vtableStructure = findVtableStructure(context, program, String.valueOf(vtable.get("name")));
 			if (vtableStructure != null) {
 				vtableAddresses.put(vtableStructure.getPathName(), vtable.get("address"));
 			}
 		}
 		List<Structure> siblings = new ArrayList<>();
-		Iterator<Structure> structures = program.getDataTypeManager().getAllStructures();
 		String className = dataStructure.getName();
 		String classPrefix = className + "_";
-		while (structures.hasNext()) {
-			Structure candidate = structures.next();
+		for (Structure candidate : context.structures) {
 			if (dataStructure.getCategoryPath().equals(candidate.getCategoryPath()) &&
 				(candidate.getName().equals(className) || candidate.getName().startsWith(classPrefix))) {
 				siblings.add(candidate);
@@ -584,7 +761,7 @@ final class StructureManager {
 			member.put("role", "vtable");
 			member.put("name", vtable.get("name"));
 			member.put("address", vtable.get("address"));
-			Structure vtableStructure = findVtableStructure(program, String.valueOf(vtable.get("name")));
+			Structure vtableStructure = findVtableStructure(context, program, String.valueOf(vtable.get("name")));
 			if (vtableStructure != null) {
 				member.put("path", vtableStructure.getPathName());
 				member.put("size", vtableStructure.getLength());
@@ -619,30 +796,19 @@ final class StructureManager {
 		return !name.endsWith("_data") && !name.contains("_vftable");
 	}
 
-	private static Structure findVtableStructure(Program program, String name) {
+	private static Structure findVtableStructure(QueryContext context, Program program, String name) {
 		if (name == null || name.isBlank()) {
 			return null;
 		}
-		SymbolIterator symbols = program.getSymbolTable().getSymbolIterator();
-		while (symbols.hasNext()) {
-			Symbol symbol = symbols.next();
-			if (!name.equals(symbol.getName(true))) {
-				continue;
-			}
+		Symbol symbol = context.vftableSymbols.get(name);
+		if (symbol != null) {
 			Data data = program.getListing().getDataAt(symbol.getAddress());
 			if (data != null && data.getDataType() instanceof Structure structure) {
 				return structure;
 			}
 		}
 		String generatedName = name.replace("::", "_");
-		Iterator<Structure> structures = program.getDataTypeManager().getAllStructures();
-		while (structures.hasNext()) {
-			Structure structure = structures.next();
-			if (generatedName.equals(structure.getName())) {
-				return structure;
-			}
-		}
-		return null;
+		return context.structuresByName.get(generatedName);
 	}
 
 	private static void appendBaseChain(Program program, String name, Map<String, Map<String, Object>> models,
@@ -858,24 +1024,29 @@ final class StructureManager {
 	}
 
 	private static DataType parseDataType(Program program, String specification) {
+		String trimmed = specification == null ? "" : specification.trim();
 		try {
-			if (specification != null && specification.startsWith("/")) {
-				int slash = specification.lastIndexOf('/');
+			if (trimmed.startsWith("/")) {
+				int slash = trimmed.lastIndexOf('/');
 				if (slash > 0) {
 					DataType referenced = program.getDataTypeManager().getDataType(
-						new DataTypePath(specification.substring(0, slash), specification.substring(slash + 1)));
+						new DataTypePath(trimmed.substring(0, slash), trimmed.substring(slash + 1)));
 					if (referenced != null) {
 						return referenced;
 					}
 				}
+				// Tolerate a leading slash before a bare type name ("/double", "/undefined4 *").
+				trimmed = trimmed.substring(1).trim();
 			}
 			DataTypeParser parser = new DataTypeParser(program.getDataTypeManager(),
 				program.getDataTypeManager(), null, DataTypeParser.AllowedDataTypes.ALL);
-			return parser.parse(specification.trim());
+			return parser.parse(trimmed);
 		}
 		catch (Exception e) {
 			throw new ProgramRegistry.BridgeException("invalid_data_type",
-				"Could not parse data type '" + specification + "': " + e.getMessage(), e);
+				"Could not parse data type '" + specification + "': " + e.getMessage()
+					+ ". Accepted forms: a type name ('int', 'double', 'undefined4'), a pointer "
+					+ "('void *', 'int **', 'Board *'), or a full datatype path ('/ClassDataTypes/Board/Board')", e);
 		}
 	}
 
@@ -886,6 +1057,96 @@ final class StructureManager {
 			}
 		}
 		return null;
+	}
+
+	private static Map<String, Object> compactResult(Structure structure, int sizeBefore,
+		List<Map<String, Object>> changed, List<Map<String, Object>> warnings) {
+		Map<String, Object> result = new LinkedHashMap<>();
+		result.put("path", structure.getPathName());
+		result.put("size_before", sizeBefore);
+		result.put("size_after", structure.getLength());
+		result.put("changed", changed);
+		if (warnings != null && !warnings.isEmpty()) {
+			result.put("embedded_size_warnings", warnings);
+		}
+		return result;
+	}
+
+	private static Map<String, Object> changedEntry(String action, String name, int offset,
+		Integer ordinal, int size) {
+		Map<String, Object> entry = new LinkedHashMap<>();
+		entry.put("action", action);
+		if (name != null) {
+			entry.put("name", name);
+		}
+		entry.put("offset", offset);
+		if (ordinal != null) {
+			entry.put("ordinal", ordinal);
+		}
+		entry.put("size", size);
+		return entry;
+	}
+
+	private static Map<String, Object> componentInfo(DataTypeComponent component) {
+		return changedEntry("replaced", component.getFieldName(), component.getOffset(),
+			component.getOrdinal(), component.getLength());
+	}
+
+	/** Bytes available at an offset before the next defined field or structure end. */
+	private static DataTypeComponent containingComponent(Structure structure, int offset) {
+		for (DataTypeComponent component : structure.getDefinedComponents()) {
+			if (offset > component.getOffset() && offset <= component.getEndOffset()) {
+				return component;
+			}
+		}
+		return null;
+	}
+
+	private static int availableBytes(Structure structure, int offset) {
+		int next = structure.getLength();
+		for (DataTypeComponent component : structure.getDefinedComponents()) {
+			if (component.getOffset() > offset && component.getOffset() < next) {
+				next = component.getOffset();
+			}
+		}
+		return next - offset;
+	}
+
+	private static List<DataTypeComponent> overlappingComponents(Structure structure, int offset, int length) {
+		List<DataTypeComponent> overlaps = new ArrayList<>();
+		int end = offset + length - 1;
+		for (DataTypeComponent component : structure.getDefinedComponents()) {
+			if (offset <= component.getEndOffset() && end >= component.getOffset()) {
+				overlaps.add(component);
+			}
+		}
+		return overlaps;
+	}
+
+	/** Structures embedding this one with a stale stored length after a size change. */
+	private static List<Map<String, Object>> embeddedSizeWarnings(Program program, Structure structure) {
+		List<Map<String, Object>> warnings = new ArrayList<>();
+		String path = structure.getPathName();
+		int actual = structure.getLength();
+		Iterator<Structure> containers = program.getDataTypeManager().getAllStructures();
+		while (containers.hasNext()) {
+			Structure container = containers.next();
+			for (DataTypeComponent component : container.getDefinedComponents()) {
+				if (!path.equals(component.getDataType().getPathName())) {
+					continue;
+				}
+				if (component.getLength() != actual) {
+					Map<String, Object> warning = new LinkedHashMap<>();
+					warning.put("structure_path", container.getPathName());
+					warning.put("field", component.getFieldName());
+					warning.put("offset", component.getOffset());
+					warning.put("stored_length", component.getLength());
+					warning.put("actual_size", actual);
+					warnings.add(warning);
+				}
+			}
+		}
+		return warnings;
 	}
 
 	private static CategoryPath category(Map<String, Object> arguments) {
@@ -959,7 +1220,7 @@ final class StructureManager {
 		return null;
 	}
 
-	private static Map<String, Object> classModelFor(Program program, Structure structure,
+	private static Map<String, Object> classModelFor(QueryContext context, Program program, Structure structure,
 		Map<String, Map<String, Object>> models) {
 		Map<String, Object> model = modelFor(structure, models);
 		if (model != null) {
@@ -972,29 +1233,57 @@ final class StructureManager {
 		analyzed.put("name", structure.getName());
 		analyzed.put("structure", structure.getPathName());
 		analyzed.put("bases", analyzedBases(structure));
-		analyzed.put("vtables", analyzedVtables(program, structure.getName()));
+		analyzed.put("vtables", analyzedVtables(context, structure.getName()));
 		analyzed.put("methods", List.of());
 		analyzed.put("analysis_source", "ghidra_class_recovery");
 		analyzed.put("rtti", true);
 		return analyzed;
 	}
 
-	private static List<Map<String, Object>> analyzedVtables(Program program, String className) {
+	private static List<Map<String, Object>> analyzedVtables(QueryContext context, String className) {
 		List<Map<String, Object>> result = new ArrayList<>();
-		var iterator = program.getSymbolTable().getSymbolIterator();
-		while (iterator.hasNext()) {
-			var symbol = iterator.next();
-			String name = symbol.getName(true);
-			if ((name.contains("vftable") || name.contains("vtable")) &&
-				!isMetadataVtable(name) &&
-				name.toLowerCase().contains(className.toLowerCase())) {
+		String lowerClassName = className.toLowerCase();
+		for (Map.Entry<String, Symbol> entry : context.vftableSymbols.entrySet()) {
+			String name = entry.getKey();
+			if (name.toLowerCase().contains(lowerClassName)) {
 				Map<String, Object> vtable = new LinkedHashMap<>();
 				vtable.put("name", name);
-				vtable.put("address", ProgramRegistry.addressMap(symbol.getAddress()));
+				vtable.put("address", ProgramRegistry.addressMap(entry.getValue().getAddress()));
 				result.add(vtable);
 			}
 		}
 		return result;
+	}
+
+	/**
+	 * One-pass indexes for a single structure/class query. The previous code
+	 * re-scanned the whole symbol table and whole data type manager per class,
+	 * which made class listing quadratic on large programs.
+	 */
+	private static final class QueryContext {
+		final Map<String, Symbol> vftableSymbols = new LinkedHashMap<>();
+		final List<Structure> structures = new ArrayList<>();
+		final Map<String, Structure> structuresByName = new HashMap<>();
+
+		static QueryContext of(Program program) {
+			QueryContext context = new QueryContext();
+			SymbolIterator symbols = program.getSymbolTable().getSymbolIterator();
+			while (symbols.hasNext()) {
+				Symbol symbol = symbols.next();
+				String name = symbol.getName(true);
+				String lower = name.toLowerCase();
+				if ((lower.contains("vftable") || lower.contains("vtable")) && !isMetadataVtable(lower)) {
+					context.vftableSymbols.putIfAbsent(name, symbol);
+				}
+			}
+			Iterator<Structure> structures = program.getDataTypeManager().getAllStructures();
+			while (structures.hasNext()) {
+				Structure structure = structures.next();
+				context.structures.add(structure);
+				context.structuresByName.putIfAbsent(structure.getName(), structure);
+			}
+			return context;
+		}
 	}
 
 	private static List<Map<String, Object>> analyzedBases(Structure structure) {

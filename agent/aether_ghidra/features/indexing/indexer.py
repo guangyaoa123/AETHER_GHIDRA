@@ -305,6 +305,24 @@ Functions:\n{chr(10).join(sections)}"""
         return updated
 
     def run(self, *, resume: bool = False, reindex: bool = False) -> FunctionIndex:
+        try:
+            return self._run(resume=resume, reindex=reindex)
+        except IndexCancelled:
+            self._save_paused_index()
+            raise
+
+    def _save_paused_index(self) -> None:
+        try:
+            metadata = self.bridge.get_program_metadata()
+            index = FunctionIndexManager.get(metadata)
+            index.indexing_state = "PAUSED"
+            index.indexed = False
+            index.batch_metadata.last_error = "Indexing paused; resume with resume=true"
+            FunctionIndexManager.save(index)
+        except Exception:
+            logger.exception("could not persist paused index")
+
+    def _run(self, *, resume: bool = False, reindex: bool = False) -> FunctionIndex:
         metadata = self.bridge.get_program_metadata()
         if reindex:
             FunctionIndexManager.clear(metadata)

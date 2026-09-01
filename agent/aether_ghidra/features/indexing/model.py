@@ -112,10 +112,10 @@ class FunctionIndex:
         return len(self.entries_by_address)
 
     def is_usable(self) -> bool:
-        return bool(self.entries_by_address) and self.indexing_state in {"COMPLETED", "IN_PROGRESS", "PARTIAL"}
+        return bool(self.entries_by_address) and self.indexing_state in {"COMPLETED", "IN_PROGRESS", "PARTIAL", "PAUSED"}
 
     def is_resumable(self) -> bool:
-        return self.indexing_state in {"IN_PROGRESS", "PARTIAL", "FAILED"}
+        return self.indexing_state in {"IN_PROGRESS", "PARTIAL", "FAILED", "PAUSED"}
 
     def add_entry(self, entry: FunctionEntry) -> None:
         self.entries_by_address[entry.address] = entry

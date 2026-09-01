@@ -4,7 +4,7 @@
 
 - `src/main/java/aether/ghidra/` is the Ghidra extension. `plugin/` owns lifecycle and UI, `bridge/` exposes the authenticated loopback API, and `program/` is the only package that reads or mutates live Ghidra `Program` state.
 - `agent/aether_ghidra/` is bundled with the extension. `api/server.py` serves the Python API; `application/runtime.py` keeps one locked chatbot session per `program_id`; `integrations/ghidra/` calls the Java bridge; `features/` contains chat and annotation workflows; `engine/` contains the domain-neutral agent runtime.
-- Keep Java and Python protocol changes synchronized. Agent workflows use a backend-neutral Program gateway; the external MCP exposes opaque `analysis_id` handles and the broker resolves them to session-scoped `program_id` values. IDs are invalid once Ghidra closes that Program. Ghidra writes belong in `ProgramRegistry` transactions. The external MCP exposes program read and write capabilities, but not chat, memory, planning, or conversation tools.
+- Keep Java and Python protocol changes synchronized. Agent workflows use a backend-neutral Program gateway. The external MCP keeps at most one Project open, identifies Programs by stable Ghidra project-domain `program_id` paths, and may also expose opaque `analysis_id` handles for open Programs. Analysis handles are invalid once Ghidra closes that Program. Ghidra writes belong in `ProgramRegistry` transactions. The external MCP exposes program read and write capabilities, but not chat, memory, planning, or conversation tools.
 
 ## Commands
 

@@ -27,6 +27,19 @@ def data_type_path(value: Any, label: str = "data_type_path") -> str:
     return value.strip()
 
 
+def type_specification(value: Any, label: str = "data_type_path") -> str:
+    """Normalize a type spec, tolerating a leading slash before a bare name.
+
+    "/undefined4" and "/int" become "undefined4" and "int"; full datatype
+    paths ("/ClassDataTypes/Board/Board") and pointer forms are preserved
+    (the Java bridge also tolerates "/undefined4 *").
+    """
+    text = data_type_path(value, label)
+    if text.startswith("/") and "/" not in text[1:]:
+        return text[1:].strip()
+    return text
+
+
 def function_ref(function_ref_value: Any) -> dict[str, Any]:
     address = function_address(function_ref_value)
     result = dict(function_ref_value)
@@ -160,7 +173,7 @@ def normalize_bridge_arguments(capability: str, arguments: dict[str, Any] | None
         result["operations"] = normalized_operations
 
     if capability == "retype_variable" and "data_type_path" in result:
-        result["data_type"] = data_type_path(result.pop("data_type_path"))
+        result["data_type"] = type_specification(result.pop("data_type_path"))
     if capability == "update_function_definition":
         if "return_type_path" in result:
             if "return_type" in result:
@@ -177,7 +190,7 @@ def _normalize_fields(fields: list[Any]) -> list[dict[str, Any]]:
             raise ValueError("Each field must be an object")
         item = dict(field)
         if "data_type_path" in item:
-            item["data_type"] = data_type_path(item.pop("data_type_path"))
+            item["data_type"] = type_specification(item.pop("data_type_path"))
         normalized.append(item)
     return normalized
 

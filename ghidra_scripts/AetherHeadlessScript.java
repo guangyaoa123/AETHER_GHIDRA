@@ -4,13 +4,7 @@ import ghidra.framework.options.Options;
 import ghidra.app.script.GhidraScript;
 import ghidra.program.util.GhidraProgramUtilities;
 
-/**
- * Starts the same AETHER bridge and Python agent used by the GUI plugin. When
- * a current Program exists, it also recovers C++ RTTI classes before waiting;
- * without one, it remains available as an empty runtime for later imports.
- * The runtime remains available until the owning MCP server or analysis
- * session explicitly closes it.
- */
+/** Starts the AETHER runtime and exposes every Program in the project. */
 public class AetherHeadlessScript extends GhidraScript {
     @Override
     public void run() throws Exception {

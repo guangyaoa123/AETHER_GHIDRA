@@ -68,6 +68,8 @@ class IndexJob:
     progress: dict[str, Any] = field(default_factory=dict)
     result: dict[str, Any] | None = None
     error: str | None = None
+    stable_id: str | None = None
+    pause_requested: bool = False
     cancel: threading.Event = field(default_factory=threading.Event)
 
 
@@ -199,6 +201,9 @@ class AgentRuntime:
         job.state = "running"
         try:
             bridge = self.gateway_for(job.program_id)
+            metadata = bridge.get_program_metadata()
+            job.stable_id = FunctionIndexManager.stable_id(metadata)
+            self._save_index_job(job)
             index = FunctionIndexer(
                 job.program_id,
                 bridge,
@@ -217,15 +222,17 @@ class AgentRuntime:
                 "message": index.batch_metadata.last_error or "",
             }
             job.state = "completed"
+            self._save_index_job(job)
         except IndexCancelled as error:
-            job.state = "cancelled"
+            job.state = "paused" if job.pause_requested else "cancelled"
             job.error = str(error)
             job.progress = {
                 **job.progress,
-                "state": "cancelled",
-                "phase": "CANCELLED",
+                "state": job.state,
+                "phase": job.state.upper(),
                 "message": str(error),
             }
+            self._save_index_job(job)
         except Exception as error:
             logger.exception("index job failed job_id=%s", job.job_id)
             job.state = "failed"
@@ -236,22 +243,68 @@ class AgentRuntime:
                 "phase": "FAILED",
                 "message": str(error),
             }
+            self._save_index_job(job)
 
-    @staticmethod
-    def _update_index_progress(job: IndexJob, update: dict[str, Any]) -> None:
+    def _update_index_progress(self, job: IndexJob, update: dict[str, Any]) -> None:
         job.progress = dict(update)
+        self._save_index_job(job)
+
+    def _save_index_job(self, job: IndexJob) -> None:
+        if job.stable_id is None:
+            return
+        FunctionIndexManager.save_job(job.stable_id, {
+            "job_id": job.job_id,
+            "program_id": job.program_id,
+            "stable_id": job.stable_id,
+            "state": job.state,
+            "progress": job.progress,
+            "error": job.error,
+        })
+
+    def _index_job_dict(self, job: IndexJob) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "job_id": job.job_id, "program_id": job.program_id, "state": job.state,
+            "progress": job.progress,
+        }
+        if job.result is not None:
+            result["result"] = job.result
+        if job.error is not None:
+            result["error"] = job.error
+        if job.state in {"paused", "cancelled", "partial", "failed"}:
+            result["resumable"] = True
+            result["resume_hint"] = "Call start_function_index with resume=true to continue."
+        return result
 
     def index_job(self, job_id: str) -> dict[str, Any]:
         with self._lock:
             job = self._index_jobs.get(job_id)
         if job is None:
-            raise KeyError(f"Unknown indexing job: {job_id}")
-        result: dict[str, Any] = {"job_id": job.job_id, "program_id": job.program_id, "state": job.state, "progress": job.progress}
-        if job.result is not None:
-            result["result"] = job.result
-        if job.error is not None:
-            result["error"] = job.error
-        return result
+            checkpoint = FunctionIndexManager.load_job(job_id)
+            if checkpoint is None:
+                return {
+                    "job_id": job_id,
+                    "state": "lost",
+                    "progress": {},
+                    "message": "Index job is no longer available; the Python agent was restarted.",
+                    "error": "Index job lost because the Python agent restarted.",
+                    "resumable": False,
+                }
+            state = str(checkpoint.get("state", "paused"))
+            if state in {"queued", "running"}:
+                state = "paused"
+            result = {
+                "job_id": job_id,
+                "program_id": str(checkpoint.get("program_id", "")),
+                "state": state,
+                "progress": dict(checkpoint.get("progress", {})),
+                "message": "Indexing was paused when the previous agent stopped.",
+                "resumable": state != "completed",
+                "resume_hint": "Call start_function_index with resume=true to continue.",
+            }
+            if checkpoint.get("error"):
+                result["error"] = checkpoint["error"]
+            return result
+        return self._index_job_dict(job)
 
     def cancel_index(self, job_id: str) -> dict[str, Any]:
         with self._lock:
@@ -261,6 +314,20 @@ class AgentRuntime:
         if job.state in {"queued", "running"}:
             job.cancel.set()
         return self.index_job(job_id)
+
+    def pause_index(self, program_id: str, timeout: float = 5.0) -> dict[str, Any]:
+        with self._lock:
+            jobs = [job for job in self._index_jobs.values()
+                    if job.program_id == program_id and job.state in {"queued", "running"}]
+        for job in jobs:
+            job.pause_requested = True
+            job.cancel.set()
+        deadline = time.monotonic() + max(0.1, timeout)
+        while jobs and time.monotonic() < deadline:
+            if all(job.state not in {"queued", "running"} for job in jobs):
+                break
+            time.sleep(0.05)
+        return {"program_id": program_id, "jobs": [self.index_job(job.job_id) for job in jobs]}
 
     def index_stats(self, program_id: str) -> dict[str, Any]:
         metadata = self.gateway_for(program_id).get_program_metadata()
@@ -273,7 +340,7 @@ class AgentRuntime:
             for tag in entry.tags:
                 if tag not in {"CRITICAL", "HIGH", "MEDIUM", "LOW", "MINIMAL"}:
                     categories[tag] = categories.get(tag, 0) + 1
-        return {"stable_id": index.stable_id, "program_name": index.program_name, "state": index.indexing_state, "progress": index.indexing_progress, "indexed": index.size(), "total": index.total_function_count, "tokens": index.total_tokens_used, "importance": importance, "categories": dict(sorted(categories.items(), key=lambda item: -item[1])[:15])}
+        return {"stable_id": index.stable_id, "program_name": index.program_name, "state": index.indexing_state, "progress": index.indexing_progress, "indexed": index.size(), "total": index.total_function_count, "tokens": index.total_tokens_used, "resumable": index.is_resumable(), "resume_hint": "Call start_function_index with resume=true to continue." if index.is_resumable() else None, "importance": importance, "categories": dict(sorted(categories.items(), key=lambda item: -item[1])[:15])}
 
     def index_entries(self, program_id: str, offset: int = 0, limit: int = 1000) -> dict[str, Any]:
         if offset < 0 or limit < 1 or limit > 5000:

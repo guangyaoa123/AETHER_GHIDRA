@@ -21,23 +21,36 @@ from aether_ghidra.api.mcp_server import (
 class FakeBridge:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, dict]] = []
+        self.analysis_status = {
+            "program_id": "/fixture", "state": "completed", "is_analyzing": False,
+            "analyzed": True, "rtti_recovery_state": "completed",
+        }
 
     def health(self):
         return {"ok": True, "protocol_version": 2, "service": "ghidra-aether-bridge"}
 
     def list_programs(self):
-        return [{"program_id": "program-1", "name": "fixture"}]
+        return [{"program_id": "/fixture", "project_path": "/fixture", "name": "fixture", "state": "open"}]
+
+    def get_project(self):
+        return {"gpr_path": "/tmp/fake.gpr", "name": "fake", "state": "open"}
+
+    def open_program(self, program_id):
+        return {"program_id": program_id, "name": Path(program_id).name, "state": "open"}
+
+    def close_program(self, program_id):
+        return {"program_id": program_id, "closed": True, "saved": True}
 
     def invoke(self, program_id, capability, arguments):
         self.calls.append((program_id, capability, arguments))
         if capability == "get_analysis_status":
-            return {"program_id": program_id, "state": "completed", "is_analyzing": False}
+            return {**self.analysis_status, "program_id": program_id}
         return {"capability": capability}
 
     def import_program(self, path):
         return {
-            "primary_program_id": "program-1",
-            "programs": [{"program_id": "program-1", "name": "imported"}],
+            "primary_program_id": "/fixture",
+            "programs": [{"program_id": "/fixture", "name": "imported", "state": "open"}],
         }
 
 
@@ -45,7 +58,7 @@ class FakeAgent:
     def request(self, method, path, payload=None):
         return {
             "job_id": "job-1",
-            "program_id": "program-1",
+            "program_id": "/fixture",
             "state": "running",
             "progress": {"progress": 25, "current_function_name": "entry"},
         }
@@ -53,6 +66,12 @@ class FakeAgent:
 
 class MCPServerTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.config_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.config_directory.cleanup)
+        manifest = Path(self.config_directory.name) / "projects.json"
+        manifest_patch = patch.dict(os.environ, {"AETHER_MCP_PROJECT_MANIFEST": str(manifest)})
+        manifest_patch.start()
+        self.addCleanup(manifest_patch.stop)
         self.bridge = FakeBridge()
         self.sessions = AnalysisSessionManager(
             bridge_factory=lambda _url: self.bridge,
@@ -118,9 +137,9 @@ class MCPServerTests(unittest.TestCase):
             "params": {"name": "get_analysis_status", "arguments": {"analysis_id": analysis_id}},
         })
         self.assertFalse(response["result"]["isError"])
-        self.assertEqual(self.bridge.calls[-1][0], "program-1")
+        self.assertEqual(self.bridge.calls[-1][0], "/fixture")
 
-    def test_initialize_queues_empty_headless_startup(self) -> None:
+    def test_initialize_reports_no_project_when_none_is_saved(self) -> None:
         manager = AnalysisSessionManager(
             bridge_factory=lambda _url: self.bridge,
             opener=lambda *_args, **_kwargs: None,
@@ -130,15 +149,13 @@ class MCPServerTests(unittest.TestCase):
             raise BridgeError("bridge unavailable", code="unreachable")
 
         manager.interactive().bridge.health = unavailable
+        manager._saved_projects = []
         application = MCPApplication(manager)
-        with patch.object(manager, "start_empty", return_value={"job_id": "startup-job", "state": "running"}) as start_empty:
-            response = application.handle({
-                "jsonrpc": "2.0", "id": 8, "method": "initialize", "params": {},
-            })
+        response = application.handle({
+            "jsonrpc": "2.0", "id": 8, "method": "initialize", "params": {},
+        })
         startup = response["result"]["startup"]
-        self.assertEqual(startup["state"], "headless_starting")
-        self.assertEqual(startup["import_job"]["job_id"], "startup-job")
-        start_empty.assert_called_once()
+        self.assertEqual(startup["state"], "no_project_open")
 
     def test_list_programs_reports_startup_instead_of_raw_bridge_failure(self) -> None:
         manager = AnalysisSessionManager(
@@ -151,26 +168,26 @@ class MCPServerTests(unittest.TestCase):
 
         manager.interactive().bridge.health = unavailable
         application = MCPApplication(manager)
-        with patch.object(manager, "start_empty", return_value={"job_id": "startup-job", "state": "running"}):
-            application.handle({
-                "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {},
-            })
-            sessions = application.handle({
-                "jsonrpc": "2.0", "id": 11, "method": "tools/call",
-                "params": {"name": "list_analysis_sessions", "arguments": {}},
-            })
-            response = application.handle({
-                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                "params": {"name": "list_programs", "arguments": {}},
-            })
+        manager._saved_projects = []
+        application.handle({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {},
+        })
+        sessions = application.handle({
+            "jsonrpc": "2.0", "id": 11, "method": "tools/call",
+            "params": {"name": "list_analysis_sessions", "arguments": {}},
+        })
+        response = application.handle({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "list_programs", "arguments": {}},
+        })
 
         session_payload = json.loads(sessions["result"]["content"][0]["text"])
         self.assertEqual(session_payload["sessions"][0]["state"], "unavailable")
         self.assertFalse("Connection refused" in json.dumps(session_payload))
         self.assertTrue(response["result"]["isError"])
         payload = json.loads(response["result"]["content"][0]["text"])
-        self.assertEqual(payload["error"], "Analysis startup is still in progress; poll get_import_job before listing Programs")
-        self.assertEqual(payload["code"], "analysis_starting")
+        self.assertEqual(payload["error"], "No Ghidra project is open")
+        self.assertEqual(payload["code"], "no_project_open")
 
     def test_empty_headless_startup_reports_actionable_no_program_error(self) -> None:
         manager = AnalysisSessionManager(
@@ -188,8 +205,7 @@ class MCPServerTests(unittest.TestCase):
             "jsonrpc": "2.0", "id": 2, "method": "tools/call",
             "params": {"name": "list_programs", "arguments": {}},
         })
-        self.assertFalse(listed["result"]["isError"])
-        self.assertEqual(json.loads(listed["result"]["content"][0]["text"])["programs"], [])
+        self.assertTrue(listed["result"]["isError"])
         missing = application.handle({
             "jsonrpc": "2.0", "id": 3, "method": "tools/call",
             "params": {"name": "get_program_metadata", "arguments": {}},
@@ -197,49 +213,58 @@ class MCPServerTests(unittest.TestCase):
         self.assertTrue(missing["result"]["isError"])
         payload = json.loads(missing["result"]["content"][0]["text"])
         self.assertEqual(payload["code"], "no_program_loaded")
-        self.assertIn("create_project", payload["error"])
 
     def test_open_and_close_existing_project(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project_path = Path(directory)
             (project_path / "existing.gpr").write_text("", encoding="utf-8")
             (project_path / "existing.rep").mkdir()
-            opened = self.sessions.open_project(directory, "existing")
+            manager = AnalysisSessionManager(bridge_factory=lambda _url: self.bridge)
+            manager._saved_projects = []
+            opened = manager.open_project(directory, "existing")
             self.assertEqual(opened.name, "existing")
-            result = self.sessions.close_project(opened.project_id)
-        self.assertTrue(result["closed"])
-        self.assertEqual(result["managed_sessions_stopped"], 0)
+            self.assertEqual(opened.project_id, str(project_path / "existing.gpr"))
 
     def test_headless_import_gets_a_temporary_project_without_a_handle(self) -> None:
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"AETHER_MCP_PROJECT_DIR": directory}):
             project = self.sessions._project_for_import({})
-        self.assertTrue(project.project_id.startswith("project-"))
+        self.assertTrue(project.project_id.endswith(".gpr"))
         self.assertTrue(project.name.startswith("import-"))
         self.assertEqual(project.path, Path(directory).resolve())
+
+    def test_open_project_persists_only_the_gpr_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
+            project_path = Path(directory)
+            (project_path / "game.gpr").write_text("", encoding="utf-8")
+            (project_path / "game.rep").mkdir()
+            manifest = Path(config) / "projects.json"
+            with patch.dict(os.environ, {"AETHER_MCP_PROJECT_MANIFEST": str(manifest)}):
+                sessions = AnalysisSessionManager(
+                    bridge_factory=lambda _url: self.bridge,
+                    opener=lambda *_args, **_kwargs: None,
+                )
+                sessions.open_project(directory, "game")
+            saved = json.loads(manifest.read_text(encoding="utf-8"))
+            self.assertEqual(saved, {"projects": [{"gpr_path": str(project_path / "game.gpr")}]} )
+
+    def test_save_session_invokes_save_for_each_program(self) -> None:
+        self.sessions._save_session(self.sessions.interactive())
+        self.assertEqual(self.bridge.calls[-1][1], "save_program")
 
     def test_project_tools_route_through_mcp(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project_path = Path(directory)
             (project_path / "existing.gpr").write_text("", encoding="utf-8")
             (project_path / "existing.rep").mkdir()
-            opened = self.application.handle({
-                "jsonrpc": "2.0", "id": 5, "method": "tools/call",
-                "params": {"name": "open_project", "arguments": {
-                    "path": directory, "name": "existing",
-                }},
-            })
-            self.assertFalse(opened["result"]["isError"])
-            project_id = json.loads(opened["result"]["content"][0]["text"])["project_id"]
-            closed = self.application.handle({
-                "jsonrpc": "2.0", "id": 6, "method": "tools/call",
-                "params": {"name": "close_project", "arguments": {
-                    "project_id": project_id,
-                }},
-            })
-            self.assertFalse(closed["result"]["isError"])
+            tools = self.application.handle({"jsonrpc": "2.0", "id": 5, "method": "tools/list", "params": {}})
+            schemas = {tool["name"]: tool["inputSchema"] for tool in tools["result"]["tools"]}
+            self.assertEqual(schemas["close_project"]["properties"], {})
+            self.assertIn("list_open_project", schemas)
+            self.assertIn("open_program", schemas)
+            self.assertIn("close_program", schemas)
 
     def test_write_tools_route_to_the_program_bridge(self) -> None:
-        common = {"session_id": "interactive", "program_id": "program-1"}
+        common = {"program_id": "/fixture"}
         calls = [
             ("rename_function", {"address": {"space": "ram", "offset": "1000"}, "name": "renamed"}),
             ("rename_variable", {"address": {"space": "ram", "offset": "1000"}, "variable_name": "local_1", "name": "value"}),
@@ -273,8 +298,7 @@ class MCPServerTests(unittest.TestCase):
             "params": {
                 "name": "get_function",
                 "arguments": {
-                    "session_id": "interactive",
-                    "program_id": "program-1",
+                    "program_id": "/fixture",
                     "address": {"space": "ram", "offset": "1000"},
                 },
             },
@@ -290,7 +314,7 @@ class MCPServerTests(unittest.TestCase):
             "method": "tools/call",
             "params": {
                 "name": "get_function_index_job",
-                "arguments": {"session_id": "interactive", "program_id": "program-1", "job_id": "job-1"},
+                "arguments": {"program_id": "/fixture", "job_id": "job-1"},
             },
         })
         progress = response["result"]["structuredContent"] if "structuredContent" in response["result"] else None
@@ -316,9 +340,19 @@ class MCPServerTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertEqual(result["state"], "completed")
         self.assertEqual(result["result"]["session_id"], "interactive")
-        self.assertEqual(result["result"]["program_id"], "program-1")
+        self.assertEqual(result["result"]["program_id"], "/fixture")
         self.assertTrue(result["result"]["analysis_id"].startswith("analysis-"))
         self.assertEqual(result["result"]["analysis_status"]["state"], "completed")
+
+    def test_rtti_failure_does_not_complete_import_barrier(self) -> None:
+        self.bridge.analysis_status = {
+            "state": "not_analyzed", "is_analyzing": False,
+            "analyzed": False, "rtti_recovery_state": "failed",
+        }
+        with self.assertRaisesRegex(RuntimeError, "RTTI recovery failed"):
+            self.sessions._wait_rtti_recovery(
+                self.sessions.interactive(), "/fixture", 0.1,
+            )
 
     def test_stdio_requires_json_rpc_and_returns_initialize(self) -> None:
         incoming = io.StringIO('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n')

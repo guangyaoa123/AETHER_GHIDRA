@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -27,6 +28,7 @@ import ghidra.program.model.data.CategoryPath;
 import ghidra.program.model.data.Structure;
 import ghidra.program.model.listing.Data;
 import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.GhidraClass;
 import ghidra.program.model.listing.Program;
 import ghidra.program.model.symbol.Namespace;
 import ghidra.program.model.symbol.Reference;
@@ -67,11 +69,12 @@ public final class AetherRttiInheritanceAnalyzer extends AbstractAnalyzer {
 		int locatorCount = 0;
 		int classCount = 0;
 		try {
+			AnalyzerContext context = AnalyzerContext.of(program);
 			for (Symbol locator : completeLocators(program, program.getMemory().getAllInitializedAddressSet())) {
 				monitor.checkCancelled();
 				locatorCount++;
 				try {
-					processLocator(program, locator, validation, classes, monitor);
+					processLocator(context, program, locator, validation, classes, monitor);
 				}
 				catch (CancelledException e) {
 					throw e;
@@ -80,7 +83,7 @@ public final class AetherRttiInheritanceAnalyzer extends AbstractAnalyzer {
 					diagnostics.put(locator.getAddress().toString(), e.getMessage());
 				}
 			}
-			processAnalyzedStructures(program, classes, monitor);
+			processAnalyzedStructures(context, program, classes, monitor);
 			linkVtableRelations(classes, monitor);
 			classCount = classes.size();
 		}
@@ -107,8 +110,9 @@ public final class AetherRttiInheritanceAnalyzer extends AbstractAnalyzer {
 		return result;
 	}
 
-	private static void processLocator(Program program, Symbol locator, DataValidationOptions validation,
-		Map<String, Map<String, Object>> classes, TaskMonitor monitor) throws Exception {
+	private static void processLocator(AnalyzerContext context, Program program, Symbol locator,
+		DataValidationOptions validation, Map<String, Map<String, Object>> classes, TaskMonitor monitor)
+		throws Exception {
 		Rtti4Model rtti4 = new Rtti4Model(program, locator.getAddress(), validation);
 		TypeDescriptorModel typeDescriptor = rtti4.getRtti0Model();
 		String classId = classId(typeDescriptor);
@@ -116,7 +120,7 @@ public final class AetherRttiInheritanceAnalyzer extends AbstractAnalyzer {
 		if (className == null || className.isBlank()) {
 			return;
 		}
-		String classPath = classPath(program, className);
+		String classPath = classPath(context, className);
 		Map<String, Object> model = classes.computeIfAbsent(classId,
 			ignored -> newClassModel(classId, className, namespace(typeDescriptor), classPath));
 		@SuppressWarnings("unchecked")
@@ -128,15 +132,15 @@ public final class AetherRttiInheritanceAnalyzer extends AbstractAnalyzer {
 
 		Rtti3Model rtti3 = rtti4.getRtti3Model();
 		if (rtti3 != null) {
-			addDirectBases(program, model, rtti3, validation, monitor);
+			addDirectBases(context, program, model, rtti3, validation, monitor);
 		}
 		for (VtableReference vtable : vtablesFor(program, locator.getAddress())) {
 			modelVtable(program, model, vtable, typeDescriptor, validation, monitor);
 		}
 	}
 
-	private static void addDirectBases(Program program, Map<String, Object> model, Rtti3Model rtti3,
-		DataValidationOptions validation, TaskMonitor monitor) throws Exception {
+	private static void addDirectBases(AnalyzerContext context, Program program, Map<String, Object> model,
+		Rtti3Model rtti3, DataValidationOptions validation, TaskMonitor monitor) throws Exception {
 		Rtti2Model rtti2 = rtti3.getRtti2Model();
 		if (rtti2 == null) {
 			return;
@@ -159,7 +163,7 @@ public final class AetherRttiInheritanceAnalyzer extends AbstractAnalyzer {
 				base.put("name", baseName);
 				base.put("qualified_name", baseName);
 				base.put("namespace", namespace(baseType));
-				String basePath = classPath(program, baseName);
+				String basePath = classPath(context, baseName);
 				base.put("structure_path", basePath);
 				base.put("class_path", basePath);
 				base.put("offset", baseModel.getMDisp());
@@ -192,7 +196,7 @@ public final class AetherRttiInheritanceAnalyzer extends AbstractAnalyzer {
 		vtables.add(vtable);
 	}
 
-	private static void processAnalyzedStructures(Program program,
+	private static void processAnalyzedStructures(AnalyzerContext context, Program program,
 		Map<String, Map<String, Object>> classes, TaskMonitor monitor) throws CancelledException {
 		Iterator<Structure> structures = program.getDataTypeManager().getAllStructures();
 		while (structures.hasNext()) {
@@ -201,7 +205,7 @@ public final class AetherRttiInheritanceAnalyzer extends AbstractAnalyzer {
 			if (!structure.getCategoryPath().getPath().contains("/ClassDataTypes/")) {
 				continue;
 			}
-			if (!isRecoveredClassStructure(program, structure)) {
+			if (!isRecoveredClassStructure(context, structure)) {
 				continue;
 			}
 			String className = structure.getName();
@@ -227,35 +231,25 @@ public final class AetherRttiInheritanceAnalyzer extends AbstractAnalyzer {
 			@SuppressWarnings("unchecked")
 			List<Map<String, Object>> bases = (List<Map<String, Object>>) model.get("bases");
 			for (Map<String, Object> base : bases) {
-				enrichBaseIdentity(program, base, classes);
+				enrichBaseIdentity(context, base, classes);
 			}
 			if (bases.isEmpty()) {
-				for (Map<String, Object> base : analyzedBases(program, structure)) {
-					enrichBaseIdentity(program, base, classes);
+				for (Map<String, Object> base : analyzedBases(context, program, structure)) {
+					enrichBaseIdentity(context, base, classes);
 					if (bases.stream().noneMatch(existing -> existing.get("name").equals(base.get("name")))) {
 						bases.add(base);
 					}
 				}
 			}
-			for (Symbol symbol : symbolsForClass(program, className)) {
+			for (Symbol symbol : symbolsForClass(context, className)) {
 				modelGenericVtable(program, model, symbol, monitor);
 			}
 		}
 	}
 
-	private static List<Symbol> symbolsForClass(Program program, String className) {
-		List<Symbol> result = new ArrayList<>();
-		SymbolIterator symbols = program.getSymbolTable().getSymbolIterator();
-		while (symbols.hasNext()) {
-			Symbol symbol = symbols.next();
-			String name = symbol.getName(true).toLowerCase();
-			if ((name.contains("vtable") || name.contains("vftable")) &&
-				!isMetadataVtable(name) &&
-				className.equals(symbol.getParentNamespace().getName())) {
-				result.add(symbol);
-			}
-		}
-		return result;
+	private static List<Symbol> symbolsForClass(AnalyzerContext context, String className) {
+		List<Symbol> result = context.vtablesByNamespace.get(className);
+		return result == null ? List.of() : result;
 	}
 
 	private static void modelGenericVtable(Program program, Map<String, Object> model,
@@ -298,7 +292,8 @@ public final class AetherRttiInheritanceAnalyzer extends AbstractAnalyzer {
 		return result;
 	}
 
-	private static List<Map<String, Object>> analyzedBases(Program program, Structure structure) {
+	private static List<Map<String, Object>> analyzedBases(AnalyzerContext context, Program program,
+		Structure structure) {
 		String description = structure.getDescription();
 		if (description == null || !description.startsWith("class ")) {
 			return List.of();
@@ -317,7 +312,7 @@ public final class AetherRttiInheritanceAnalyzer extends AbstractAnalyzer {
 			if (!name.isEmpty()) {
 				Map<String, Object> base = new LinkedHashMap<>();
 				base.put("name", name);
-				String path = classPath(program, name);
+				String path = classPath(context, name);
 				base.put("class_id", path == null ? null : "structure:" + path);
 				base.put("structure_path", path);
 				base.put("class_path", path);
@@ -329,7 +324,7 @@ public final class AetherRttiInheritanceAnalyzer extends AbstractAnalyzer {
 		return result;
 	}
 
-	private static void enrichBaseIdentity(Program program, Map<String, Object> base,
+	private static void enrichBaseIdentity(AnalyzerContext context, Map<String, Object> base,
 		Map<String, Map<String, Object>> classes) {
 		String name = base.get("name") == null ? null : String.valueOf(base.get("name"));
 		if (name == null || name.isBlank()) {
@@ -337,7 +332,7 @@ public final class AetherRttiInheritanceAnalyzer extends AbstractAnalyzer {
 		}
 		String path = base.get("structure_path") == null ? null : String.valueOf(base.get("structure_path"));
 		if (path == null || path.isBlank() || "null".equals(path)) {
-			path = classPath(program, name);
+			path = classPath(context, name);
 		}
 		for (Map<String, Object> candidate : classes.values()) {
 			if (!name.equals(candidate.get("name"))) {
@@ -363,19 +358,12 @@ public final class AetherRttiInheritanceAnalyzer extends AbstractAnalyzer {
 		}
 	}
 
-	private static boolean isRecoveredClassStructure(Program program, Structure structure) {
+	private static boolean isRecoveredClassStructure(AnalyzerContext context, Structure structure) {
 		String description = structure.getDescription();
 		if (description != null && description.startsWith("class ")) {
 			return true;
 		}
-		Iterator<ghidra.program.model.listing.GhidraClass> classes =
-			program.getSymbolTable().getClassNamespaces();
-		while (classes.hasNext()) {
-			if (structure.getName().equals(classes.next().getName())) {
-				return true;
-			}
-		}
-		return false;
+		return context.classNamespaceNames.contains(structure.getName());
 	}
 
 	private static List<Map<String, Object>> vtableSlots(Program program, Address vtableAddress,
@@ -507,21 +495,73 @@ public final class AetherRttiInheritanceAnalyzer extends AbstractAnalyzer {
 		return separator < 0 ? null : name.substring(0, separator);
 	}
 
-	private static String classPath(Program program, String name) {
+	/**
+	 * Resolves the ClassDataTypes structure path for a possibly qualified class
+	 * name. Preserves the previous first-match-in-DTM-order semantics across the
+	 * exact-path and short-name predicates by comparing DTM order indexes.
+	 */
+	private static String classPath(AnalyzerContext context, String name) {
 		String shortName = name.substring(name.lastIndexOf("::") + 2);
 		String expected = "/ClassDataTypes/" + name.replace("::", "/") + "/" + shortName;
-		Iterator<Structure> structures = program.getDataTypeManager().getAllStructures();
-		while (structures.hasNext()) {
-			Structure structure = structures.next();
-			if (expected.equals(structure.getPathName())) {
-				return structure.getPathName();
-			}
-			if (structure.getCategoryPath().getPath().contains(CLASS_DATA_TYPES) &&
-				shortName.equals(structure.getName())) {
-				return structure.getPathName();
-			}
+		Structure exact = context.structureByPath.get(expected);
+		Structure byName = context.classStructureByName.get(shortName);
+		if (exact == null) {
+			return byName == null ? null : byName.getPathName();
 		}
-		return null;
+		if (byName == null) {
+			return exact.getPathName();
+		}
+		Integer exactOrder = context.structureOrder.get(exact);
+		Integer nameOrder = context.structureOrder.get(byName);
+		if (exactOrder != null && nameOrder != null && nameOrder < exactOrder) {
+			return byName.getPathName();
+		}
+		return exact.getPathName();
+	}
+
+	/**
+	 * One-pass indexes for a single analyzer run. The previous code re-scanned
+	 * the symbol table, the data type manager, and the class namespaces per
+	 * class or per base, which made graph recompute quadratic on large programs.
+	 */
+	private static final class AnalyzerContext {
+		final Map<String, List<Symbol>> vtablesByNamespace = new HashMap<>();
+		final Map<String, Structure> structureByPath = new HashMap<>();
+		final Map<String, Structure> classStructureByName = new HashMap<>();
+		final Map<Structure, Integer> structureOrder = new IdentityHashMap<>();
+		final Set<String> classNamespaceNames = new HashSet<>();
+
+		static AnalyzerContext of(Program program) {
+			AnalyzerContext context = new AnalyzerContext();
+			SymbolIterator symbols = program.getSymbolTable().getSymbolIterator();
+			while (symbols.hasNext()) {
+				Symbol symbol = symbols.next();
+				Namespace parent = symbol.getParentNamespace();
+				if (parent == null) {
+					continue;
+				}
+				String name = symbol.getName(true).toLowerCase();
+				if ((name.contains("vtable") || name.contains("vftable")) && !isMetadataVtable(name)) {
+					context.vtablesByNamespace.computeIfAbsent(parent.getName(),
+						ignored -> new ArrayList<>()).add(symbol);
+				}
+			}
+			Iterator<GhidraClass> namespaces = program.getSymbolTable().getClassNamespaces();
+			while (namespaces.hasNext()) {
+				context.classNamespaceNames.add(namespaces.next().getName());
+			}
+			int order = 0;
+			Iterator<Structure> structures = program.getDataTypeManager().getAllStructures();
+			while (structures.hasNext()) {
+				Structure structure = structures.next();
+				context.structureByPath.put(structure.getPathName(), structure);
+				if (structure.getCategoryPath().getPath().contains(CLASS_DATA_TYPES)) {
+					context.classStructureByName.putIfAbsent(structure.getName(), structure);
+				}
+				context.structureOrder.put(structure, order++);
+			}
+			return context;
+		}
 	}
 
 	private record VtableReference(Address metaPointerAddress, Address vtableAddress) {

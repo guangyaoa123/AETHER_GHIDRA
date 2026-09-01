@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 from aether_ghidra.integrations.ghidra.bridge_client import BridgeClient, BridgeError
 from aether_ghidra.application.runtime import AgentRuntime, ToolPolicyError
 from aether_ghidra.engine import AgentCancelled
+from aether_ghidra.features.indexing.manager import FunctionIndexManager
 
 
 class BridgeClientTests(unittest.TestCase):
@@ -155,6 +156,18 @@ class BridgeClientTests(unittest.TestCase):
 
         self.assertEqual(state["state"], "lost")
         self.assertIn("restarted", state["error"])
+
+    def test_missing_index_job_recovers_persisted_checkpoint(self) -> None:
+        runtime = AgentRuntime(Mock())
+        with patch.object(FunctionIndexManager, "load_job", return_value={
+            "job_id": "old-job", "program_id": "program-1", "state": "running",
+            "progress": {"percent": 35, "indexed": 4, "total": 10},
+        }):
+            state = runtime.index_job("old-job")
+
+        self.assertEqual(state["state"], "paused")
+        self.assertTrue(state["resumable"])
+        self.assertIn("resume=true", state["resume_hint"])
 
 
 if __name__ == "__main__":

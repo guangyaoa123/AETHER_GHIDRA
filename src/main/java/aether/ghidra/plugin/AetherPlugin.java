@@ -49,6 +49,7 @@ import aether.ghidra.AetherPluginPackage;
 import aether.ghidra.bridge.BridgeServer;
 import aether.ghidra.bridge.Json;
 import aether.ghidra.observability.DebugLog;
+import aether.ghidra.program.RttiAnalysisStore;
 import aether.ghidra.program.RttiRecoveryRunner;
 import aether.ghidra.program.ProgramRegistry;
 import aether.ghidra.plugin.config.AetherToolConfigStore;
@@ -377,6 +378,18 @@ public class AetherPlugin extends Plugin implements PopupActionProvider {
 		if (program == null) {
 			return;
 		}
+		restoreImportedAnalysisMarker(program);
+		if (RttiAnalysisStore.hasStoredGraph(program)) {
+			// The class graph is persisted with the Program; only refresh the view.
+			String programId = registry.idFor(program);
+			SwingUtilities.invokeLater(() -> {
+				if (classInfoProvider != null && programId != null) {
+					classInfoProvider.programChanged(programId);
+				}
+				tool.setStatusInfo("AETHER loaded the stored class graph");
+			});
+			return;
+		}
 		synchronized (rttiRecoveryScheduled) {
 			if (!rttiRecoveryScheduled.add(program)) {
 				return;
@@ -396,14 +409,39 @@ public class AetherPlugin extends Plugin implements PopupActionProvider {
 				SwingUtilities.invokeLater(() -> tool.setStatusInfo(
 					"AETHER is recovering C++ RTTI classes..."));
 				RttiRecoveryRunner.run(tool, program, TaskMonitor.DUMMY);
-				SwingUtilities.invokeLater(() -> tool.setStatusInfo(
-					"AETHER C++ RTTI recovery complete"));
+				String programId = registry.idFor(program);
+				SwingUtilities.invokeLater(() -> {
+					if (classInfoProvider != null && programId != null) {
+						classInfoProvider.programChanged(programId);
+					}
+					tool.setStatusInfo("AETHER C++ RTTI recovery complete");
+				});
 			}
 			catch (Exception error) {
 				SwingUtilities.invokeLater(() -> Msg.showError(AetherPlugin.this, null,
 					"AETHER RTTI Recovery", error.getMessage()));
 			}
 		});
+	}
+
+	private void restoreImportedAnalysisMarker(Program program) {
+		if (program.isClosed() || GhidraProgramUtilities.isAnalyzed(program)) {
+			return;
+		}
+		String recoveryState = program.getOptions("AETHER")
+			.getString("rtti_import_recovery_state", "");
+		if (!"completed".equals(recoveryState)) {
+			return;
+		}
+		int transaction = program.startTransaction("AETHER: restore analyzed state");
+		boolean commit = false;
+		try {
+			GhidraProgramUtilities.markProgramAnalyzed(program);
+			commit = true;
+		}
+		finally {
+			program.endTransaction(transaction, commit);
+		}
 	}
 
 	private boolean waitForInitialAnalysis(Program program) {
@@ -493,9 +531,23 @@ public class AetherPlugin extends Plugin implements PopupActionProvider {
 			if (programId != null && provider != null) {
 				provider.programChanged(programId);
 			}
+			scheduleClassGraphRefresh(program, programId);
 		};
 		program.addListener(listener);
 		programListeners.put(program, listener);
+	}
+
+	private void scheduleClassGraphRefresh(Program program, String programId) {
+		ProgramRegistry currentRegistry = registry;
+		if (currentRegistry == null || program.isClosed()) {
+			return;
+		}
+		currentRegistry.scheduleClassGraphRefresh(program, () -> SwingUtilities.invokeLater(() -> {
+			if (classInfoProvider != null && programId != null) {
+				classInfoProvider.programChanged(programId);
+			}
+			tool.setStatusInfo("AETHER refreshed the stored class graph");
+		}));
 	}
 
 	private void detachProgramListener(Program program) {

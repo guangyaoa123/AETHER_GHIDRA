@@ -1,6 +1,8 @@
 package aether.ghidra.headless;
 
 import ghidra.program.model.listing.Program;
+import ghidra.framework.model.Project;
+import java.util.List;
 
 import aether.ghidra.bridge.BridgeServer;
 import aether.ghidra.plugin.AgentProcess;
@@ -13,7 +15,17 @@ public final class HeadlessAetherRuntime implements AutoCloseable {
 	private final AgentProcess agent;
 
 	public HeadlessAetherRuntime(Program program, int bridgePort) {
-		registry = new ProgramRegistry(program);
+		this(program == null ? List.of() : List.of(program), bridgePort);
+	}
+
+	public HeadlessAetherRuntime(List<Program> programs, int bridgePort) {
+		registry = new ProgramRegistry(programs);
+		bridge = new BridgeServer(registry, bridgePort);
+		agent = new AgentProcess();
+	}
+
+	public HeadlessAetherRuntime(Project project, Program initialProgram, int bridgePort) {
+		registry = new ProgramRegistry(project, initialProgram);
 		bridge = new BridgeServer(registry, bridgePort);
 		agent = new AgentProcess();
 	}

@@ -50,6 +50,24 @@ class BridgeClient:
         response = self._request("GET", "/v1/programs")
         return response["programs"]
 
+    def get_project(self) -> dict[str, Any]:
+        self._ensure_protocol()
+        return self._request("GET", "/v1/project")["project"]
+
+    def open_program(self, program_id: str) -> dict[str, Any]:
+        self._ensure_protocol()
+        return self._request("POST", "/v1/programs/open", {
+            "protocol_version": PROTOCOL_VERSION,
+            "program_id": program_id,
+        })["result"]
+
+    def close_program(self, program_id: str) -> dict[str, Any]:
+        self._ensure_protocol()
+        return self._request("POST", "/v1/programs/close", {
+            "protocol_version": PROTOCOL_VERSION,
+            "program_id": program_id,
+        })["result"]
+
     def import_program(self, path: str) -> dict[str, Any]:
         self._ensure_protocol()
         response = self._request(

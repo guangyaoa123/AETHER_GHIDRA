@@ -31,6 +31,7 @@ final class ProgramContext {
 	Map<String, Object> metadata() {
 		Map<String, Object> result = new LinkedHashMap<>();
 		result.put("program_id", id);
+		result.put("project_path", id);
 		result.put("name", safe(program.getName()));
 		result.put("executable_path", safe(program.getExecutablePath()));
 		result.put("executable_format", safe(program.getExecutableFormat()));
@@ -40,6 +41,8 @@ final class ProgramContext {
 		result.put("compiler", safe(program.getCompiler()));
 		result.put("compiler_spec", safe(program.getCompilerSpec().getCompilerSpecID().getIdAsString()));
 		result.put("function_count", program.getFunctionManager().getFunctionCount());
+		result.put("state", "open");
+		result.put("dirty", program.isChanged());
 		result.put("active", active);
 		return result;
 	}

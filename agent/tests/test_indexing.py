@@ -16,6 +16,35 @@ from aether_ghidra.features.indexing.taxonomy import DynamicTagManager
 
 
 class IndexingTests(unittest.TestCase):
+    def test_job_checkpoint_round_trips(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "job.json"
+            with patch.object(FunctionIndexManager, "job_path", return_value=path):
+                FunctionIndexManager.save_job("sha", {"job_id": "job-1", "state": "paused"})
+                with patch.object(Path, "glob", return_value=iter([path])):
+                    loaded = FunctionIndexManager.load_job("job-1")
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded["state"], "paused")
+
+    def test_cancellation_persists_paused_index(self) -> None:
+        class CancelledBridge:
+            def get_program_metadata(self):
+                return {"sha256": "paused-test", "name": "fixture", "function_count": 1}
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "index.json"
+            with patch.object(FunctionIndexManager, "path", return_value=path):
+                FunctionIndexManager._cache.clear()
+                indexer = FunctionIndexer("program", CancelledBridge(), cancel=threading.Event())
+                indexer.cancel.set()
+                with self.assertRaises(IndexCancelled):
+                    indexer.run()
+                saved = FunctionIndex.load(path)
+
+        self.assertIsNotNone(saved)
+        self.assertEqual(saved.indexing_state, "PAUSED")
+        self.assertTrue(saved.is_resumable())
+
     def test_provider_request_honors_cancellation(self) -> None:
         started = threading.Event()
         release = threading.Event()

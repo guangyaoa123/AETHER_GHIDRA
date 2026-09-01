@@ -88,6 +88,8 @@ class AgentHandler(BaseHTTPRequestHandler):
                 self._send(200, {"ok": True})
             elif self.path == "/v1/index-jobs":
                 self._send(202, {"ok": True, "result": self.runtime.start_index(payload["program_id"], resume=bool(payload.get("resume")), reindex=bool(payload.get("reindex")))})
+            elif self.path == "/v1/index-jobs/pause":
+                self._send(200, {"ok": True, "result": self.runtime.pause_index(payload["program_id"])})
             elif self.path.startswith("/v1/index-jobs/") and self.path.endswith("/cancel"):
                 job_id = self.path.removeprefix("/v1/index-jobs/").removesuffix("/cancel").rstrip("/")
                 self._send(200, {"ok": True, "result": self.runtime.cancel_index(job_id)})

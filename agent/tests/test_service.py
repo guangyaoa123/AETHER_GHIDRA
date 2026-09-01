@@ -62,6 +62,9 @@ class FakeRuntime:
     def index_entries(self, program_id, offset=0, limit=1000):
         return {"program_id": program_id, "offset": offset, "limit": limit, "functions": []}
 
+    def pause_index(self, program_id):
+        return {"program_id": program_id, "jobs": []}
+
 
 class ServiceRouteTests(unittest.TestCase):
     @classmethod
@@ -160,6 +163,11 @@ class ServiceRouteTests(unittest.TestCase):
         status, entries = self.request("POST", "/v1/index-entries", {"program_id": "program-1"})
         self.assertEqual(status, 200)
         self.assertEqual(entries["result"]["program_id"], "program-1")
+
+    def test_index_pause_route(self):
+        status, response = self.request("POST", "/v1/index-jobs/pause", {"program_id": "program-1"})
+        self.assertEqual(status, 200)
+        self.assertEqual(response["result"]["program_id"], "program-1")
 
 
 if __name__ == "__main__":
