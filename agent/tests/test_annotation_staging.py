@@ -30,6 +30,8 @@ class MutationStagingTests(unittest.TestCase):
         self.assertEqual(len(staging.operations), 4)
         with self.assertRaisesRegex(ValueError, "frozen annotation context"):
             staging.stage_function("rename_function", {"address": {"space": "ram", "offset": "2000"}}, "nope", resolver)
+        with self.assertRaisesRegex(ValueError, "frozen annotation context"):
+            staging.stage_code_comment("1004", "eol", "comment")
 
     def test_duplicate_target_is_rejected_without_mutating(self) -> None:
         staging = MutationStaging(self.context)
@@ -121,11 +123,6 @@ class MutationStagingTests(unittest.TestCase):
         resolver = lambda _target: self.fail("name-only target reached resolver")
         with self.assertRaisesRegex(ValueError, "function_ref"):
             staging.stage_function("rename_function", "entry", "decode", resolver)
-
-    def test_bare_code_comment_location_is_rejected(self) -> None:
-        staging = MutationStaging(self.context)
-        with self.assertRaisesRegex(ValueError, "structured address"):
-            staging.stage_code_comment("1004", "eol", "comment")
 
 
 if __name__ == "__main__":

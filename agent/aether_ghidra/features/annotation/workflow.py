@@ -161,6 +161,15 @@ class AnnotationWorkflow:
                     inverse_operation["definition"] = json.loads(operation.get("before", "{}"))
                 except (TypeError, json.JSONDecodeError) as error:
                     raise ValueError("Cannot undo malformed function-definition history") from error
+            if operation.get("kind") == "rename_function" and operation.get("vtable_fields"):
+                inverse_operation["restore_vtable_fields"] = [
+                    {
+                        "structure": field.get("structure"),
+                        "ordinal": field.get("ordinal"),
+                        "name": field.get("before"),
+                    }
+                    for field in operation["vtable_fields"]
+                ]
             inverse.append(inverse_operation)
             if operation.get("created_decompiler_variable"):
                 inverse[-1]["remove_decompiler_variable"] = True

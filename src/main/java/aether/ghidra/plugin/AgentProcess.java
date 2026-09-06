@@ -3,7 +3,9 @@ package aether.ghidra.plugin;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.net.InetSocketAddress;
 import java.net.URI;
+import java.net.Socket;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
@@ -14,6 +16,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Stream;
 import java.util.concurrent.TimeUnit;
 
 import ghidra.util.Msg;
@@ -28,25 +31,37 @@ import aether.ghidra.observability.DebugLog;
 /** Starts and owns the bundled Python agent for the lifetime of the Ghidra plugin. */
 public final class AgentProcess {
 	private static final String DEFAULT_AGENT_URL = "http://127.0.0.1:8780";
+	private static final String AGENT_PROCESS_MARKER = "aether_ghidra.api.server";
 	private static final HttpClient HTTP_CLIENT = HttpClient.newBuilder()
 		.connectTimeout(Duration.ofMillis(200))
 		.build();
 
 	private Process process;
+	private ProcessHandle adoptedProcess;
+	private Path adoptedPidfile;
+	private Thread shutdownHook;
 	private boolean managed;
 	private final ConsoleService consoleService;
+	private final String configuredAgentUrl;
 
 	public AgentProcess() {
-		consoleService = null;
+		this(null, null);
 	}
 
 	public AgentProcess(PluginTool tool) {
+		this(tool, null);
+	}
+
+	public AgentProcess(PluginTool tool, String agentUrl) {
 		consoleService = tool == null ? null : tool.getService(ConsoleService.class);
+		configuredAgentUrl = agentUrl == null || agentUrl.isBlank() ? null : agentUrl.replaceAll("/$", "");
 	}
 
 	public void start(int bridgePort) {
 		DebugLog.debug(this, "starting Python agent bridge_port=" + bridgePort + " agent_url=" + agentUrl());
+		sweepStaleAgents();
 		if (isHealthy()) {
+			adoptHealthyAgent();
 			Msg.info(this, "Reusing the existing AETHER Python agent at " + agentUrl());
 			return;
 		}
@@ -75,6 +90,7 @@ public final class AgentProcess {
 		try {
 			process = builder.start();
 			managed = true;
+			installShutdownHook();
 			startOutputLogger(process);
 			waitForStartup();
 		}
@@ -84,23 +100,30 @@ public final class AgentProcess {
 	}
 
 	public void stop() {
-		if (!managed || process == null) {
+		if (!managed) {
 			DebugLog.debug(this, "Python agent is not managed; nothing to stop");
 			return;
 		}
-		process.destroy();
 		DebugLog.debug(this, "stopping managed Python agent");
-		try {
-			if (!process.waitFor(3, TimeUnit.SECONDS)) {
-				process.destroyForcibly();
-			}
+		if (process != null) {
+			stopProcess(process);
 		}
-		catch (InterruptedException e) {
-			Thread.currentThread().interrupt();
-			process.destroyForcibly();
+		else if (adoptedProcess != null) {
+			stopProcess(adoptedProcess);
+		}
+		if (adoptedPidfile != null) {
+			try {
+				Files.deleteIfExists(adoptedPidfile);
+			}
+			catch (IOException e) {
+				DebugLog.debug(this, "could not remove adopted agent pidfile: " + e.getMessage());
+			}
 		}
 		managed = false;
 		process = null;
+		adoptedProcess = null;
+		adoptedPidfile = null;
+		removeShutdownHook();
 	}
 
 	void restart(int bridgePort) {
@@ -113,7 +136,7 @@ public final class AgentProcess {
 	}
 
 	boolean isManaged() {
-		return managed && process != null;
+		return managed && (process != null || adoptedProcess != null);
 	}
 
 	private void waitForStartup() {
@@ -140,35 +163,221 @@ public final class AgentProcess {
 	}
 
 	private boolean isHealthy() {
+		return isHealthyAt(agentUrl());
+	}
+
+	static boolean isHealthyAt(String endpoint) {
+		return isHealthyAt(endpoint, "aether-ghidra-agent");
+	}
+
+	private static boolean isHealthyAt(String endpoint, String service) {
+		return readHealth(endpoint).map(body ->
+			Boolean.TRUE.equals(body.get("ok")) && service.equals(body.get("service")) &&
+			body.get("protocol_version") instanceof Number number &&
+			number.intValue() == BridgeServer.PROTOCOL_VERSION).orElse(false);
+	}
+
+	private static java.util.Optional<Map<String, Object>> readHealth(String endpoint) {
 		try {
 			HttpRequest request = HttpRequest.newBuilder()
-				.uri(URI.create(agentUrl() + "/health"))
+				.uri(URI.create(endpoint + "/health"))
 				.timeout(Duration.ofMillis(200))
 				.GET()
 				.build();
 			HttpResponse<String> response = HTTP_CLIENT.send(request,
 				HttpResponse.BodyHandlers.ofString());
 			if (response.statusCode() < 200 || response.statusCode() >= 300) {
+				return java.util.Optional.empty();
+			}
+			return java.util.Optional.of(Json.object(Json.parse(response.body())));
+		}
+		catch (Exception e) {
+			return java.util.Optional.empty();
+		}
+	}
+
+	static boolean isPortInUse(String endpoint) {
+		try {
+			URI uri = URI.create(endpoint);
+			if (uri.getHost() == null || uri.getPort() < 1) {
 				return false;
 			}
-			Map<String, Object> body = Json.object(Json.parse(response.body()));
-			Object protocolVersion = body.get("protocol_version");
-			return Boolean.TRUE.equals(body.get("ok")) &&
-				"aether-ghidra-agent".equals(body.get("service")) &&
-				protocolVersion instanceof Number number && number.intValue() == BridgeServer.PROTOCOL_VERSION;
+			try (Socket socket = new Socket()) {
+				socket.connect(new InetSocketAddress(uri.getHost(), uri.getPort()), 200);
+				return true;
+			}
 		}
 		catch (Exception e) {
 			return false;
 		}
 	}
 
-	private static String agentUrl() {
+	private String agentUrl() {
+		if (configuredAgentUrl != null) {
+			return configuredAgentUrl;
+		}
 		String configured = System.getenv("AETHER_AGENT_URL");
 		return (configured == null || configured.isBlank() ? DEFAULT_AGENT_URL : configured)
 			.replaceAll("/$", "");
 	}
 
-	private static void configureAgentEndpoint(Map<String, String> environment) {
+	private void adoptHealthyAgent() {
+		Map<String, Object> health = readHealth(agentUrl()).orElse(null);
+		if (health == null || !(health.get("pid") instanceof Number number)) {
+			return;
+		}
+		Path pidfile = agentPidfilePath(agentUrl());
+		Map<String, Object> metadata;
+		try {
+			if (!Files.isRegularFile(pidfile)) {
+				return;
+			}
+			metadata = Json.object(Json.parse(Files.readString(pidfile)));
+		}
+		catch (Exception e) {
+			return;
+		}
+		Object recordedPid = metadata.get("pid");
+		if (!(recordedPid instanceof Number) || ((Number) recordedPid).longValue() != number.longValue()) {
+			return;
+		}
+		adoptedProcess = ProcessHandle.of(number.longValue()).orElse(null);
+		if (adoptedProcess != null && adoptedProcess.isAlive()) {
+			adoptedPidfile = pidfile;
+			managed = true;
+			installShutdownHook();
+		}
+	}
+
+	private static Path agentRunDirectory() {
+		String configured = System.getenv("AETHER_AGENT_RUN_DIR");
+		if (configured != null && !configured.isBlank()) {
+			return Path.of(configured).toAbsolutePath().normalize();
+		}
+		return Path.of(System.getProperty("user.home"), ".config", "aether-ghidra", "run");
+	}
+
+	private static Path agentPidfilePath(String endpoint) {
+		try {
+			return agentRunDirectory().resolve("agent-" + URI.create(endpoint).getPort() + ".pid");
+		}
+		catch (IllegalArgumentException e) {
+			return agentRunDirectory().resolve("agent-invalid.pid");
+		}
+	}
+
+	private static void sweepStaleAgents() {
+		Path directory = agentRunDirectory();
+		if (!Files.isDirectory(directory)) {
+			return;
+		}
+		try (Stream<Path> paths = Files.list(directory)) {
+			paths.filter(path -> path.getFileName().toString().startsWith("agent-") &&
+				path.getFileName().toString().endsWith(".pid"))
+				.forEach(AgentProcess::sweepPidfile);
+		}
+		catch (IOException e) {
+			DebugLog.debug(AgentProcess.class, "could not scan agent pidfiles: " + e.getMessage());
+		}
+	}
+
+	private static void sweepPidfile(Path pidfile) {
+		Map<String, Object> metadata;
+		try {
+			metadata = Json.object(Json.parse(Files.readString(pidfile)));
+		}
+		catch (Exception e) {
+			return;
+		}
+		if (!(metadata.get("pid") instanceof Number pidNumber) ||
+			!(metadata.get("agent_url") instanceof String agentEndpoint)) {
+			return;
+		}
+		ProcessHandle handle = ProcessHandle.of(pidNumber.longValue()).orElse(null);
+		if (handle == null || !handle.isAlive()) {
+			try {
+				Files.deleteIfExists(pidfile);
+			}
+			catch (IOException ignored) {
+				// A later sweep can remove an inaccessible stale pidfile.
+			}
+			return;
+		}
+		String commandLine = handle.info().commandLine().orElse("");
+		if (!commandLine.contains(AGENT_PROCESS_MARKER)) {
+			return;
+		}
+		Map<String, Object> health = readHealth(agentEndpoint).orElse(null);
+		if (health == null || !(health.get("pid") instanceof Number healthPid) ||
+			healthPid.longValue() != pidNumber.longValue()) {
+			return;
+		}
+		String bridgeEndpoint = metadata.get("bridge_url") instanceof String value ? value : "";
+		if (bridgeEndpoint.isBlank() || isHealthyAt(bridgeEndpoint, "ghidra-aether-bridge")) {
+			return;
+		}
+		DebugLog.debug(AgentProcess.class, "stopping stale agent pid=" + pidNumber +
+			" with unavailable bridge=" + bridgeEndpoint);
+		handle.destroy();
+		try {
+			handle.onExit().get(2, TimeUnit.SECONDS);
+		}
+		catch (Exception e) {
+			if (handle.isAlive()) {
+				handle.destroyForcibly();
+			}
+		}
+	}
+
+	private void installShutdownHook() {
+		if (shutdownHook != null) {
+			return;
+		}
+		shutdownHook = new Thread(this::stop, "aether-python-agent-shutdown");
+		shutdownHook.setDaemon(true);
+		Runtime.getRuntime().addShutdownHook(shutdownHook);
+	}
+
+	private void removeShutdownHook() {
+		Thread hook = shutdownHook;
+		shutdownHook = null;
+		if (hook == null || hook == Thread.currentThread()) {
+			return;
+		}
+		try {
+			Runtime.getRuntime().removeShutdownHook(hook);
+		}
+		catch (IllegalStateException ignored) {
+			// The JVM is already shutting down.
+		}
+	}
+
+	private static void stopProcess(Process process) {
+		process.destroy();
+		try {
+			if (!process.waitFor(3, TimeUnit.SECONDS)) {
+				process.destroyForcibly();
+			}
+		}
+		catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			process.destroyForcibly();
+		}
+	}
+
+	private static void stopProcess(ProcessHandle process) {
+		process.destroy();
+		try {
+			process.onExit().get(3, TimeUnit.SECONDS);
+		}
+		catch (Exception e) {
+			if (process.isAlive()) {
+				process.destroyForcibly();
+			}
+		}
+	}
+
+	private void configureAgentEndpoint(Map<String, String> environment) {
 		try {
 			URI endpoint = URI.create(agentUrl());
 			if (endpoint.getHost() != null) {

@@ -3,12 +3,14 @@ from __future__ import annotations
 import io
 import json
 import os
+import signal
 import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
+from aether_ghidra.api import mcp_server
 from aether_ghidra.api.mcp_server import (
     AnalysisSessionManager,
     BridgeError,
@@ -72,6 +74,9 @@ class MCPServerTests(unittest.TestCase):
         manifest_patch = patch.dict(os.environ, {"AETHER_MCP_PROJECT_MANIFEST": str(manifest)})
         manifest_patch.start()
         self.addCleanup(manifest_patch.stop)
+        gui_patch = patch.object(AnalysisSessionManager, "_gui_ghidra_running", return_value=False)
+        gui_patch.start()
+        self.addCleanup(gui_patch.stop)
         self.bridge = FakeBridge()
         self.sessions = AnalysisSessionManager(
             bridge_factory=lambda _url: self.bridge,
@@ -91,10 +96,16 @@ class MCPServerTests(unittest.TestCase):
         names = {tool["name"] for tool in response["result"]["tools"]}
         self.assertIn("get_analysis_status", names)
         self.assertIn("start_function_index", names)
+        self.assertIn("get_function_index_job", names)
+        self.assertIn("cancel_function_index", names)
+        self.assertIn("get_function_index_stats", names)
+        self.assertIn("list_function_index_entries", names)
+        self.assertIn("search_function_index", names)
         self.assertIn("import_binary", names)
+        self.assertIn("forget_project", names)
         for name in {
             "rename_function", "rename_variable", "retype_variable", "update_function_definition",
-            "set_function_comment", "set_code_unit_comment", "apply_annotation_batch",
+            "set_function_comment", "set_code_unit_comment",
             "create_struct", "add_fields", "update_fields", "remove_fields", "resize_struct",
             "create_class", "update_class", "delete_class",
         }:
@@ -103,6 +114,18 @@ class MCPServerTests(unittest.TestCase):
         self.assertNotIn("add_memory", names)
         self.assertNotIn("add_action_plan", names)
         self.assertNotIn("get_function_pseudocode", names)
+        self.assertNotIn("apply_annotation_batch", names)
+        schemas = {tool["name"]: tool["inputSchema"] for tool in response["result"]["tools"]}
+        self.assertEqual(schemas["close_project"]["properties"], {})
+        self.assertIn("list_open_project", schemas)
+        self.assertIn("open_program", schemas)
+        self.assertIn("close_program", schemas)
+        self.assertEqual(schemas["forget_project"]["required"], ["gpr_path"])
+        response = self.application.handle({
+            "jsonrpc": "2.0", "id": 41, "method": "tools/call",
+            "params": {"name": "apply_annotation_batch", "arguments": {"program_id": "/fixture"}},
+        })
+        self.assertEqual(response["error"]["data"]["code"], "unknown_tool")
 
     def test_function_targeting_tools_use_address_only(self) -> None:
         response = self.application.handle({"jsonrpc": "2.0", "id": 6, "method": "tools/list", "params": {}})
@@ -116,6 +139,7 @@ class MCPServerTests(unittest.TestCase):
             self.assertNotIn("function_ref", schema["properties"])
             self.assertIn("address", schema["required"])
         self.assertNotIn("include_pseudocode", tools["get_function"]["inputSchema"]["properties"])
+        self.assertIn("vtable", tools["rename_function"]["description"])
 
     def test_initialize_reports_existing_interactive_startup(self) -> None:
         response = self.application.handle({
@@ -124,6 +148,30 @@ class MCPServerTests(unittest.TestCase):
         self.assertEqual(response["result"]["startup"]["state"], "connected")
         self.assertEqual(response["result"]["startup"]["session_id"], "interactive")
         self.assertTrue(response["result"]["startup"]["analyses"][0]["analysis_id"].startswith("analysis-"))
+
+    def test_orphan_lease_reaper_escalates_to_sigkill(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            lease_dir = Path(directory) / "sessions"
+            lease_dir.mkdir()
+            with patch.dict(os.environ, {"AETHER_MCP_SESSION_DIR": str(lease_dir)}):
+                manager = AnalysisSessionManager(
+                    bridge_factory=lambda _url: self.bridge,
+                    opener=lambda *_args, **_kwargs: None,
+                )
+            lease = lease_dir / "headless-test.json"
+            lease.write_text(json.dumps({"owner_pid": 1234, "process_pid": 5678}), encoding="utf-8")
+            with patch.object(os, "kill", side_effect=ProcessLookupError), \
+                 patch.object(os, "killpg") as killpg, \
+                 patch.object(time, "monotonic", side_effect=[0.0, 1.0, 3.0]), \
+                 patch.object(manager, "sleep") as sleep, \
+                 patch.object(manager, "_process_group_alive", return_value=True):
+                manager._reap_orphan_leases()
+            self.assertEqual(killpg.call_args_list, [
+                call(5678, signal.SIGTERM),
+                call(5678, signal.SIGKILL),
+            ])
+            sleep.assert_called_once_with(0.1)
+            self.assertFalse(lease.exists())
 
     def test_program_operations_route_through_opaque_analysis_id(self) -> None:
         listed = self.application.handle({
@@ -139,24 +187,6 @@ class MCPServerTests(unittest.TestCase):
         self.assertFalse(response["result"]["isError"])
         self.assertEqual(self.bridge.calls[-1][0], "/fixture")
 
-    def test_initialize_reports_no_project_when_none_is_saved(self) -> None:
-        manager = AnalysisSessionManager(
-            bridge_factory=lambda _url: self.bridge,
-            opener=lambda *_args, **_kwargs: None,
-        )
-
-        def unavailable():
-            raise BridgeError("bridge unavailable", code="unreachable")
-
-        manager.interactive().bridge.health = unavailable
-        manager._saved_projects = []
-        application = MCPApplication(manager)
-        response = application.handle({
-            "jsonrpc": "2.0", "id": 8, "method": "initialize", "params": {},
-        })
-        startup = response["result"]["startup"]
-        self.assertEqual(startup["state"], "no_project_open")
-
     def test_list_programs_reports_startup_instead_of_raw_bridge_failure(self) -> None:
         manager = AnalysisSessionManager(
             bridge_factory=lambda _url: self.bridge,
@@ -169,9 +199,10 @@ class MCPServerTests(unittest.TestCase):
         manager.interactive().bridge.health = unavailable
         application = MCPApplication(manager)
         manager._saved_projects = []
-        application.handle({
+        initialized = application.handle({
             "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {},
         })
+        self.assertEqual(initialized["result"]["startup"]["state"], "no_project_open")
         sessions = application.handle({
             "jsonrpc": "2.0", "id": 11, "method": "tools/call",
             "params": {"name": "list_analysis_sessions", "arguments": {}},
@@ -214,17 +245,6 @@ class MCPServerTests(unittest.TestCase):
         payload = json.loads(missing["result"]["content"][0]["text"])
         self.assertEqual(payload["code"], "no_program_loaded")
 
-    def test_open_and_close_existing_project(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            project_path = Path(directory)
-            (project_path / "existing.gpr").write_text("", encoding="utf-8")
-            (project_path / "existing.rep").mkdir()
-            manager = AnalysisSessionManager(bridge_factory=lambda _url: self.bridge)
-            manager._saved_projects = []
-            opened = manager.open_project(directory, "existing")
-            self.assertEqual(opened.name, "existing")
-            self.assertEqual(opened.project_id, str(project_path / "existing.gpr"))
-
     def test_headless_import_gets_a_temporary_project_without_a_handle(self) -> None:
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"AETHER_MCP_PROJECT_DIR": directory}):
             project = self.sessions._project_for_import({})
@@ -243,25 +263,97 @@ class MCPServerTests(unittest.TestCase):
                     bridge_factory=lambda _url: self.bridge,
                     opener=lambda *_args, **_kwargs: None,
                 )
-                sessions.open_project(directory, "game")
+                opened = sessions.open_project(directory, "game")
+            self.assertEqual(opened.name, "game")
+            self.assertEqual(opened.project_id, str(project_path / "game.gpr"))
             saved = json.loads(manifest.read_text(encoding="utf-8"))
             self.assertEqual(saved, {"projects": [{"gpr_path": str(project_path / "game.gpr")}]} )
+
+    def test_manifest_prunes_missing_projects_and_can_forget_existing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
+            project_path = Path(directory)
+            existing = project_path / "existing.gpr"
+            existing.write_text("", encoding="utf-8")
+            manifest = Path(config) / "projects.json"
+            manifest.write_text(json.dumps({"projects": [
+                {"gpr_path": str(project_path / "missing.gpr")},
+                {"gpr_path": str(existing)},
+            ]}), encoding="utf-8")
+            with patch.dict(os.environ, {"AETHER_MCP_PROJECT_MANIFEST": str(manifest)}):
+                manager = AnalysisSessionManager(
+                    bridge_factory=lambda _url: self.bridge,
+                    opener=lambda *_args, **_kwargs: None,
+                )
+                self.assertEqual(manager._saved_projects, [existing.resolve()])
+                result = manager.forget_project(str(existing))
+            self.assertTrue(result["forgotten"])
+            self.assertEqual(json.loads(manifest.read_text(encoding="utf-8")), {"projects": []})
+
+    def test_startup_reports_locked_saved_project_without_spawning_headless(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
+            project_path = Path(directory)
+            gpr = project_path / "locked.gpr"
+            gpr.write_text("", encoding="utf-8")
+            manifest = Path(config) / "projects.json"
+            manifest.write_text(json.dumps({"projects": [{"gpr_path": str(gpr)}]}), encoding="utf-8")
+            with patch.dict(os.environ, {
+                "AETHER_MCP_PROJECT_MANIFEST": str(manifest),
+                "AETHER_MCP_BRIDGE_RETRIES": "0",
+            }):
+                popen = Mock()
+                manager = AnalysisSessionManager(
+                    bridge_factory=lambda _url: self.bridge,
+                    opener=lambda *_args, **_kwargs: None,
+                    popen_factory=popen,
+                )
+
+                def unavailable():
+                    raise BridgeError("bridge unavailable", code="unreachable")
+
+                manager.interactive().bridge.health = unavailable
+                lock_path = gpr.with_suffix(".lock")
+                lock_path.write_text("held", encoding="utf-8")
+                with patch.object(mcp_server.fcntl, "lockf", side_effect=BlockingIOError):
+                    startup = manager.startup()
+            self.assertEqual(startup["state"], "project_locked")
+            self.assertEqual(startup["lock_path"], str(lock_path))
+            popen.assert_not_called()
+
+    def test_startup_waits_for_gui_bridge_before_headless_fallback(self) -> None:
+        manager = AnalysisSessionManager(
+            bridge_factory=lambda _url: self.bridge,
+            opener=lambda *_args, **_kwargs: None,
+        )
+        health = manager.interactive().bridge.health
+        manager.interactive().bridge.health = Mock(side_effect=[
+            BridgeError("bridge starting", code="unreachable"), health(),
+        ])
+        manager._saved_projects = []
+        with patch.object(manager, "sleep") as sleep:
+            startup = manager.startup()
+        self.assertEqual(startup["state"], "connected")
+        sleep.assert_called_once_with(0.5)
+
+    def test_startup_pauses_restore_when_gui_ghidra_is_present(self) -> None:
+        manager = AnalysisSessionManager(
+            bridge_factory=lambda _url: self.bridge,
+            opener=lambda *_args, **_kwargs: None,
+            popen_factory=Mock(),
+        )
+
+        def unavailable():
+            raise BridgeError("bridge unavailable", code="unreachable")
+
+        manager.interactive().bridge.health = unavailable
+        with patch.dict(os.environ, {"AETHER_MCP_BRIDGE_RETRIES": "0"}), \
+             patch.object(manager, "_gui_ghidra_running", return_value=True):
+            startup = manager.startup()
+        self.assertEqual(startup["state"], "gui_bridge_unavailable")
+        manager.popen_factory.assert_not_called()
 
     def test_save_session_invokes_save_for_each_program(self) -> None:
         self.sessions._save_session(self.sessions.interactive())
         self.assertEqual(self.bridge.calls[-1][1], "save_program")
-
-    def test_project_tools_route_through_mcp(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            project_path = Path(directory)
-            (project_path / "existing.gpr").write_text("", encoding="utf-8")
-            (project_path / "existing.rep").mkdir()
-            tools = self.application.handle({"jsonrpc": "2.0", "id": 5, "method": "tools/list", "params": {}})
-            schemas = {tool["name"]: tool["inputSchema"] for tool in tools["result"]["tools"]}
-            self.assertEqual(schemas["close_project"]["properties"], {})
-            self.assertIn("list_open_project", schemas)
-            self.assertIn("open_program", schemas)
-            self.assertIn("close_program", schemas)
 
     def test_write_tools_route_to_the_program_bridge(self) -> None:
         common = {"program_id": "/fixture"}
@@ -272,7 +364,6 @@ class MCPServerTests(unittest.TestCase):
             ("update_function_definition", {"address": {"space": "ram", "offset": "1000"}, "return_type": "int", "parameters": []}),
             ("set_function_comment", {"address": {"space": "ram", "offset": "1000"}, "comment": "note"}),
             ("set_code_unit_comment", {"location": {"space": "ram", "offset": "1000"}, "comment_kind": "eol", "comment": "note"}),
-            ("apply_annotation_batch", {"operations": [{"kind": "rename_function", "target": {"function_address": {"space": "ram", "offset": "1000"}}, "value": "renamed"}]}),
             ("create_struct", {"name": "Record"}),
             ("add_fields", {"structure_path": "/Record", "fields": []}),
             ("update_fields", {"structure_path": "/Record", "fields": []}),
@@ -330,6 +421,75 @@ class MCPServerTests(unittest.TestCase):
         self.assertEqual(progress["current"], "worker")
         self.assertEqual(progress["message"], "retry")
 
+    def test_indexing_tools_route_to_agent(self) -> None:
+        agent = Mock()
+        agent.request.side_effect = [
+            {"job_id": "job/1", "program_id": "/fixture", "state": "queued", "progress": {"progress": 0}},
+            {"job_id": "job/1", "program_id": "/fixture", "state": "running", "progress": {"progress": 25}},
+            {"job_id": "job/1", "program_id": "/fixture", "state": "cancelled", "progress": {"progress": 25}},
+            {"stable_id": "sha", "indexed": 1, "total": 2},
+            {"offset": 2, "limit": 3, "entries": [{"name": "entry"}]},
+            {"query": "network", "results": ["entry"]},
+        ]
+        self.sessions.interactive().agent = agent
+
+        def invoke_tool(name, arguments):
+            return self.application.handle({
+                "jsonrpc": "2.0", "id": name, "method": "tools/call",
+                "params": {"name": name, "arguments": {"program_id": "/fixture", **arguments}},
+            })["result"]
+
+        started = invoke_tool("start_function_index", {"resume": True, "reindex": True})
+        status = invoke_tool("get_function_index_job", {"job_id": "job/1"})
+        cancelled = invoke_tool("cancel_function_index", {"job_id": "job/1"})
+        stats = invoke_tool("get_function_index_stats", {})
+        entries = invoke_tool("list_function_index_entries", {"offset": 2, "limit": 3})
+        search = invoke_tool("search_function_index", {"query": "network"})
+
+        self.assertFalse(started["isError"])
+        self.assertEqual(json.loads(started["content"][0]["text"])["progress"]["percent"], 0)
+        self.assertFalse(status["isError"])
+        self.assertEqual(json.loads(status["content"][0]["text"])["progress"]["percent"], 25)
+        self.assertFalse(cancelled["isError"])
+        self.assertEqual(json.loads(stats["content"][0]["text"])["stable_id"], "sha")
+        self.assertEqual(json.loads(entries["content"][0]["text"])["entries"][0]["name"], "entry")
+        self.assertEqual(json.loads(search["content"][0]["text"])["results"], ["entry"])
+        agent.request.assert_has_calls([
+            call("POST", "/v1/index-jobs", {"program_id": "/fixture", "resume": True, "reindex": True}),
+            call("GET", "/v1/index-jobs/job%2F1"),
+            call("POST", "/v1/index-jobs/job%2F1/cancel", {}),
+            call("POST", "/v1/index-stats", {"program_id": "/fixture"}),
+            call("POST", "/v1/index-entries", {"program_id": "/fixture", "offset": 2, "limit": 3}),
+            call("POST", "/v1/index-search", {"program_id": "/fixture", "query": "network"}),
+        ])
+
+    def test_indexing_tools_enforce_analysis_and_program_guards(self) -> None:
+        agent = Mock()
+        self.sessions.interactive().agent = agent
+        self.bridge.analysis_status["is_analyzing"] = True
+        blocked = self.application.handle({
+            "jsonrpc": "2.0", "id": 50, "method": "tools/call",
+            "params": {"name": "start_function_index", "arguments": {"program_id": "/fixture"}},
+        })
+        blocked_payload = json.loads(blocked["result"]["content"][0]["text"])
+        self.assertTrue(blocked["result"]["isError"])
+        self.assertEqual(blocked_payload["code"], "analysis_in_progress")
+        agent.request.assert_not_called()
+
+        self.bridge.analysis_status["is_analyzing"] = False
+        agent.request.return_value = {
+            "job_id": "job-1", "program_id": "/other", "state": "running", "progress": {},
+        }
+        mismatch = self.application.handle({
+            "jsonrpc": "2.0", "id": 51, "method": "tools/call",
+            "params": {"name": "get_function_index_job", "arguments": {
+                "program_id": "/fixture", "job_id": "job-1",
+            }},
+        })
+        mismatch_payload = json.loads(mismatch["result"]["content"][0]["text"])
+        self.assertTrue(mismatch["result"]["isError"])
+        self.assertEqual(mismatch_payload["code"], "program_mismatch")
+
     def test_import_automatically_uses_interactive_session(self) -> None:
         with tempfile.NamedTemporaryFile() as binary:
             job = self.sessions.import_binary({"binary_path": binary.name})
@@ -359,6 +519,12 @@ class MCPServerTests(unittest.TestCase):
         outgoing = io.StringIO()
         serve_stdio(incoming, outgoing, application=MCPApplication(self.sessions))
         self.assertIn('"protocolVersion":"2024-11-05"', outgoing.getvalue())
+
+    def test_stdio_closes_managed_sessions_when_stdin_ends(self) -> None:
+        sessions = Mock()
+        application = MCPApplication(sessions)
+        serve_stdio(io.StringIO(), io.StringIO(), application=application)
+        sessions.close_all.assert_called_once()
 
 
 if __name__ == "__main__":

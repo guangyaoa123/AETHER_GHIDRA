@@ -1,7 +1,10 @@
 import ghidra.app.script.GhidraScript;
 import ghidra.app.util.importer.MessageLog;
 import ghidra.framework.options.Options;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.listing.Function;
 import java.util.Map;
+import java.util.List;
 
 import aether.ghidra.bridge.Json;
 import aether.ghidra.program.AetherRttiInheritanceAnalyzer;
@@ -56,8 +59,80 @@ public class AetherRttiReprocessSmoke extends GhidraScript {
         require(!classJson.contains("\"class_name\":\"Base_data\""), "Base_data leaked as a separate class");
         require(!classJson.contains("\"role\":\"vtable\",\"name\":\"Base::vtable\""),
             "Metadata-only Base vtable leaked into grouped structures");
+        require(verifyVirtualRename(registry, programId, child),
+            "A recovered virtual function did not update its applied vtable slot field");
         println("AETHER_RTTI_REPROCESS_SMOKE_OK");
         println(analysis);
+    }
+
+    private boolean verifyVirtualRename(ProgramRegistry registry, String programId,
+        Map<String, Object> child) throws Exception {
+        Map<String, Object> classModel = objectMap(child.get("class"));
+        if (classModel == null) {
+            return false;
+        }
+        for (Map<String, Object> vtable : mapList(classModel.get("vtables"))) {
+            for (Map<String, Object> slot : mapList(vtable.get("slots"))) {
+                Map<String, Object> functionInfo = objectMap(slot.get("function"));
+                Map<String, Object> addressMap = objectMap(functionInfo == null ? null : functionInfo.get("address"));
+                if (addressMap == null) {
+                    continue;
+                }
+                Address address = currentAddress(addressMap);
+                Function function = currentProgram.getFunctionManager().getFunctionAt(address);
+                if (function == null) {
+                    continue;
+                }
+                String original = function.getName();
+                try {
+                    Map<String, Object> renamed = registry.invoke(programId, "rename_function", Map.of(
+                        "address", addressMap, "name", "aether_virtual_rename_smoke",
+                        "propagate_virtual", false));
+                    List<Map<String, Object>> fields = mapList(renamed.get("vtable_fields"));
+                    if (fields.isEmpty()) {
+                        continue;
+                    }
+                    for (Map<String, Object> field : fields) {
+                        Map<String, Object> structure = registry.invoke(programId, "get_struct",
+                            Map.of("path", field.get("structure")));
+                        for (Map<String, Object> current : mapList(structure.get("fields"))) {
+                            if (field.get("ordinal").equals(current.get("ordinal"))) {
+                                require("aether_virtual_rename_smoke".equals(current.get("name")),
+                                    "Updated vtable field was not readable after rename");
+                                return true;
+                            }
+                        }
+                    }
+                }
+                finally {
+                    registry.invoke(programId, "rename_function", Map.of(
+                        "address", addressMap, "name", original, "propagate_virtual", false));
+                }
+            }
+        }
+        return false;
+    }
+
+    private Address currentAddress(Map<String, Object> address) {
+        return currentProgram.getAddressFactory().getAddress(
+            address.get("space") + ":" + address.get("offset"));
+    }
+
+    private static Map<String, Object> objectMap(Object value) {
+        return value instanceof Map<?, ?> map ? Json.object(map) : null;
+    }
+
+    private static List<Map<String, Object>> mapList(Object value) {
+        if (!(value instanceof Iterable<?> values)) {
+            return List.of();
+        }
+        java.util.ArrayList<Map<String, Object>> result = new java.util.ArrayList<>();
+        for (Object item : values) {
+            if (item instanceof Map<?, ?> map) {
+                result.add(Json.object(map));
+            }
+        }
+        return result;
     }
 
     private static void require(boolean condition, String message) {

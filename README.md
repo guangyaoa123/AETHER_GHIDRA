@@ -2,14 +2,14 @@
 
 This directory is a new, independent Ghidra integration. The Java extension owns live Ghidra state; the Python process owns the legacy-compatible chatbot orchestration, memory, plans, and tool loop.
 
-The Java source is organized into `plugin/` (lifecycle and UI), `bridge/` (authenticated transport), `program/` (live Program capabilities), and `observability/`. The Python agent is organized into `api/`, `application/`, `integrations/ghidra/`, `features/`, `tools/`, `config/`, `observability/`, and the domain-neutral `engine/`.
+The Java source is organized into `plugin/` (lifecycle and UI), `bridge/` (loopback transport), `program/` (live Program capabilities), and `observability/`. The Python agent is organized into `api/`, `application/`, `integrations/ghidra/`, `features/`, `tools/`, `config/`, `observability/`, and the domain-neutral `engine/`.
 
 ```text
 Ghidra Java plugin
   - Program lifecycle registry
   - explicit program_id routing
   - Ghidra capability wrappers and transactions
-  - authenticated loopback HTTP bridge
+  - loopback HTTP bridge
 
 Python agent service
   - bridge client
@@ -139,7 +139,7 @@ curl -s http://127.0.0.1:8780/v1/index-jobs \
 
 The fixture and its expected symbols are documented in `testdata/index_fixture/README.md`. A real indexing run requires the configured LLM credentials; `index-stats` and `index-search` are safe checks before starting one.
 
-Set `OPENAI_API_KEY` and optionally `OPENAI_BASE_URL` and `OPENAI_MODEL` before starting Ghidra, or write them to `~/.config/aether-ghidra/config.json`. The provider uses the legacy transport behavior: OpenAI-compatible requests, a 600-second timeout, and disabled TLS certificate verification.
+Set `OPENAI_API_KEY` and optionally `OPENAI_BASE_URL` and `OPENAI_MODEL` before starting Ghidra, or write them to `~/.config/aether-ghidra/config.json`. The provider uses the legacy transport behavior: OpenAI-compatible requests, disabled TLS certificate verification, and a 600-second timeout for chat and annotation requests. Function indexing defaults to a 1800-second provider timeout, configurable with `INDEXING_TIMEOUT_SEC` in `~/.config/aether-ghidra/config.json`.
 
 For debugging, set `DEBUG` to `true` and optionally `LOG_FILE` in `~/.config/aether-ghidra/config.json`, or use the environment variables above. Application logs include request routes, program IDs, capabilities, durations, tool names, and result sizes. Annotation jobs additionally report flow stages, progress, LLM rounds, model tool calls, bridge calls, operation counts, and total elapsed time in the Ghidra console when the managed Python agent is running. Conversation bodies are written only to the separate JSONL transcript when configured. Both local services report protocol version `2` in their health responses.
 
@@ -152,11 +152,11 @@ cd agent
 uv run python -m aether_ghidra.api.mcp_server
 ```
 
-At MCP initialization, AETHER first probes the existing interactive bridge. If it is unavailable, it starts an empty managed headless runtime with no loaded Program. `list_programs` returns an empty list while the runtime is ready; Program-scoped tools return an actionable `no_program_loaded` error until the agent creates or opens a project and imports a binary. The initialization response and `list_analysis_sessions` report the startup state and job.
+At MCP initialization, AETHER first probes the existing interactive bridge with a short grace period. If a GUI Ghidra JVM is present but its bridge is not ready, headless auto-restore pauses so the GUI can open a project without losing the lock. Otherwise, the most recently saved existing Project is restored headlessly; a held Ghidra project lock produces `project_locked` instead of starting a conflicting session. With no saved Project, AETHER starts an empty managed headless runtime with no loaded Program. The initialization response and `list_analysis_sessions` report the startup state and job.
 
 The MCP server exposes one backend-independent Ghidra surface with at most one open Project. It uses the active interactive Project when available and otherwise owns one managed headless Project. Use `create_project` for a new workspace or `open_project` for an existing `.gpr`/`.rep` Project; both open it immediately. `list_open_project` reports that Project, and `list_programs` enumerates every stored Program without opening closed Programs. `open_program` and `close_program` control individual Programs by their stable Ghidra project-domain path, such as `/folder/client.exe`. `close_project` takes no arguments, verifies saves for all open Programs, and only then stops the managed backend.
 
-Project persistence records only the `.gpr` path in `~/.config/aether-ghidra/mcp-projects.json` (override with `AETHER_MCP_PROJECT_MANIFEST`), and the most recently used saved Project is restored on the next MCP session. `import_binary` imports into the open Project; if none is open, it creates a unique temporary Project under `AETHER_MCP_PROJECT_DIR` (default `/tmp/aether-ghidra-projects`). Poll `get_import_job` until analysis and RTTI recovery complete. Program tools accept the stable `program_id`; opaque `analysis_id` handles remain available for clients that use broker handles. Managed headless sessions remain alive until their Project or analysis session is explicitly closed, or the MCP server shuts down. The startup timeout only bounds readiness checks and does not expire a ready session. The MCP surface excludes chat, conversation, memory, and planning tools while exposing Program reads and writes.
+Project persistence records only the `.gpr` path in `~/.config/aether-ghidra/mcp-projects.json` (override with `AETHER_MCP_PROJECT_MANIFEST`), and `forget_project` removes a saved auto-restore entry without deleting the Project. `import_binary` imports into the open Project; if none is open, it creates a unique temporary Project under `AETHER_MCP_PROJECT_DIR` (default `/tmp/aether-ghidra-projects`). Poll `get_import_job` until analysis and RTTI recovery complete. Program tools accept the stable `program_id`; opaque `analysis_id` handles remain available for clients that use broker handles. Managed headless sessions remain alive until their Project or analysis session is explicitly closed, or the MCP server receives stdin EOF, SIGTERM, or SIGINT. The startup timeout only bounds readiness checks and does not expire a ready session. The MCP surface excludes chat, conversation, memory, and planning tools while exposing Program reads and writes.
 
 After import, `get_analysis_status` reports whether Ghidra auto-analysis is still running and includes `rtti_recovery_state` while import-time C++ class recovery is running or has completed. The import job completes after that recovery barrier when the installed bridge supports the status field. Function indexing is asynchronous; `get_function_index_job` always returns a structured `progress` object with phase, state, percentage, indexed count, total count, current function, and message.
 
@@ -165,7 +165,6 @@ After import, `get_analysis_status` reports whether Ghidra auto-analysis is stil
 - `get_program_metadata`
 - `get_analysis_status`
 - `list_functions`
-- `get_function`
 - `get_function` (returns function metadata plus address-aware pseudocode and resolved calls)
 - `get_data_at_address`
 - `get_xrefs_to`
@@ -175,11 +174,10 @@ After import, `get_analysis_status` reports whether Ghidra auto-analysis is stil
 - `set_code_unit_comment`
 - `get_function_call_tree`
 - `get_annotation_context`
-- `apply_annotation_batch`
 - `list_struct` and `get_struct` (plain structures and class-backed structures, including available inheritance metadata)
 - `create_struct`, `add_fields`, `update_fields`, `remove_fields`, and `resize_struct`
 - `create_class`, `update_class`, and `delete_class`
 
 During initial analysis or import, AETHER runs Ghidra's `RecoverClassesFromRTTIScript.java` and then runs **AETHER RTTI Inheritance** after reference analysis. The same workflow runs for GUI programs, headless MCP imports, and interactive bridge imports; the existing **AETHER > Recover C++ RTTI Classes** action remains available to rerun it manually. Recovery follows the compiler and architecture support provided by Ghidra, including 32/64-bit Windows/MSVC and GCC/Itanium programs. The analyzer consumes Ghidra's applied RTTI models and recovered class data types to persist direct and transitive inheritance, base-subobject offsets, vtables, and parent/child virtual-function slot relationships. `get_struct` reads this analysis output; it does not trigger RTTI parsing.
 
-Program operations use stable Ghidra project-domain `program_id` values. Open Programs also receive optional opaque broker `analysis_id` handles, which are invalidated when the backing session or Program closes. Function-targeting MCP tools accept an exact structured `address`; returned function metadata also uses `address` as its sole identity field. Writes are serialized per Program and run inside Ghidra transactions. Function, variable, definition, and comment writes can be issued individually or as an atomic `apply_annotation_batch`; structure and class writes apply immediately. Class metadata is stored with the Program and references native Ghidra structures. RTTI is consumed from Ghidra's existing analysis output rather than exposed as a separate AETHER tool.
+Program operations use stable Ghidra project-domain `program_id` values. Open Programs also receive optional opaque broker `analysis_id` handles, which are invalidated when the backing session or Program closes. Function-targeting MCP tools accept an exact structured `address`; returned function metadata also uses `address` as its sole identity field. Writes are serialized per Program and run inside Ghidra transactions. External MCP function, variable, definition, and comment writes are issued individually; the GUI annotation workflow may still use its internal atomic batch capability. Structure and class writes apply immediately. Class metadata is stored with the Program and references native Ghidra structures. RTTI is consumed from Ghidra's existing analysis output rather than exposed as a separate AETHER tool.

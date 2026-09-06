@@ -2,7 +2,10 @@ package aether.ghidra.program;
 
 import java.io.File;
 import java.util.ArrayList;
+import java.util.ArrayDeque;
 import java.util.Comparator;
+import java.util.Deque;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
@@ -35,9 +38,12 @@ import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSpace;
 import ghidra.program.model.address.AddressIterator;
 import ghidra.program.model.data.DataType;
+import ghidra.program.model.data.DataTypeComponent;
 import ghidra.program.model.data.DataTypePath;
+import ghidra.program.model.data.Structure;
 import ghidra.program.model.listing.CircularDependencyException;
 import ghidra.program.model.listing.CodeUnit;
+import ghidra.program.model.listing.Data;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.Function.FunctionUpdateType;
 import ghidra.program.model.listing.FunctionIterator;
@@ -508,6 +514,37 @@ public final class ProgramRegistry {
 	 */
 	public void scheduleClassGraphRefresh(Program program, Runnable onComplete) {
 		classGraphRefresher.schedule(program, onComplete);
+	}
+
+	/** Propagates a rename already made by Ghidra's GUI through its verified virtual family. */
+	public int propagateVirtualRename(Program program, Address address) throws Exception {
+		if (program == null || address == null) {
+			return 0;
+		}
+		Function target = program.getFunctionManager().getFunctionAt(address);
+		if (target == null) {
+			return 0;
+		}
+		List<Function> family = virtualFunctionFamily(program, target);
+		if (family.size() <= 1) {
+			return 0;
+		}
+		String name = target.getName();
+		int transaction = program.startTransaction("AETHER: propagate virtual rename");
+		boolean commit = false;
+		try {
+			for (Function member : family) {
+				if (member != target && !name.equals(member.getName())) {
+					member.setName(name, SourceType.USER_DEFINED);
+				}
+			}
+			renameVtableFields(program, family, name);
+			commit = true;
+		}
+		finally {
+			program.endTransaction(transaction, commit);
+		}
+		return family.size() - 1;
 	}
 
 	private Map<String, Object> getAnalysisStatus(Program program, String programId) {
@@ -1235,7 +1272,7 @@ public final class ProgramRegistry {
 				prepared.add(item);
 			}
 			for (Map<String, Object> operation : prepared) {
-				applyPreparedAnnotation(operation);
+				applyPreparedAnnotation(program, operation);
 			}
 			commit = true;
 		}
@@ -1255,6 +1292,7 @@ public final class ProgramRegistry {
 			result.put("after", operation.get("after"));
 			result.put("comment_kind", operation.get("comment_kind"));
 			result.put("created_decompiler_variable", operation.get("created_decompiler_variable"));
+			result.put("vtable_fields", operation.get("vtable_fields"));
 			applied.add(result);
 		}
 		Map<String, Object> result = new LinkedHashMap<>();
@@ -1364,13 +1402,18 @@ public final class ProgramRegistry {
 	}
 
 	@SuppressWarnings("unchecked")
-	private static void applyPreparedAnnotation(Map<String, Object> operation) {
+	private static void applyPreparedAnnotation(Program program, Map<String, Object> operation) {
 		String kind = String.valueOf(operation.get("kind"));
 		String after = String.valueOf(operation.get("after"));
 		switch (kind) {
 			case "rename_function" -> {
 				try {
-					((Function) operation.get("function")).setName(after, SourceType.USER_DEFINED);
+					Function function = (Function) operation.get("function");
+					function.setName(after, SourceType.USER_DEFINED);
+					List<Map<String, Object>> restoreFields = mapList(operation.get("restore_vtable_fields"));
+					operation.put("vtable_fields", restoreFields.isEmpty()
+						? renameVtableFields(program, List.of(function), after)
+						: restoreVtableFields(program, restoreFields));
 				}
 				catch (Exception e) {
 					throw new BridgeException("annotation_failed", "Could not rename function: " + e.getMessage(), e);
@@ -1783,15 +1826,32 @@ public final class ProgramRegistry {
 			throw new BridgeException("invalid_argument", "name must not be blank");
 		}
 		Function function = functionAt(program, arguments);
+		List<Function> family = Boolean.FALSE.equals(arguments.get("propagate_virtual"))
+			? List.of(function) : virtualFunctionFamily(program, function);
+		List<Map<String, Object>> before = new ArrayList<>();
+		for (Function member : family) {
+			Map<String, Object> item = new LinkedHashMap<>();
+			item.put("address", addressMap(member.getEntryPoint()));
+			item.put("before", qualifiedFunctionName(member));
+			before.add(item);
+		}
 		String delimiter = Namespace.NAMESPACE_DELIMITER;
 		int separator = name.lastIndexOf(delimiter);
 		int transaction = program.startTransaction("AETHER: rename function");
 		boolean commit = false;
 		try {
 			if (separator < 0) {
-				function.setName(name, SourceType.USER_DEFINED);
+				for (Function member : family) {
+					member.setName(name, SourceType.USER_DEFINED);
+				}
+				List<Map<String, Object>> vtableFields = renameVtableFields(program, family, name);
 				commit = true;
-				return functionMap(function);
+				Map<String, Object> result = functionMap(function);
+				result.put("propagated", family.size() > 1);
+				result.put("virtual_family_size", family.size());
+				result.put("renamed_functions", before);
+				result.put("vtable_fields", vtableFields);
+				return result;
 			}
 			String namespacePath = name.substring(0, separator);
 			String baseName = name.substring(separator + delimiter.length());
@@ -1804,27 +1864,264 @@ public final class ProgramRegistry {
 				throw new BridgeException("invalid_argument",
 					"Namespace components must be non-empty: " + name);
 			}
-			function.setName(baseName, SourceType.USER_DEFINED);
-			if (!function.getParentNamespace().equals(target)) {
-				try {
-					function.getSymbol().setNamespace(target);
+			for (Function member : family) {
+				member.setName(baseName, SourceType.USER_DEFINED);
+				if (member != function) {
+					continue;
 				}
-				catch (DuplicateNameException error) {
-					throw new BridgeException("already_exists",
-						"A symbol named '" + baseName + "' already exists in namespace '"
-							+ target.getName(true) + "'", error);
-				}
-				catch (InvalidInputException | CircularDependencyException error) {
-					throw new BridgeException("namespace_failed",
-						"Could not move function into namespace '" + target.getName(true)
-							+ "': " + error.getMessage(), error);
+				if (!member.getParentNamespace().equals(target)) {
+					try {
+						member.getSymbol().setNamespace(target);
+					}
+					catch (DuplicateNameException error) {
+						throw new BridgeException("already_exists",
+							"A symbol named '" + baseName + "' already exists in namespace '"
+								+ target.getName(true) + "'", error);
+					}
+					catch (InvalidInputException | CircularDependencyException error) {
+						throw new BridgeException("namespace_failed",
+							"Could not move function into namespace '" + target.getName(true)
+								+ "': " + error.getMessage(), error);
+					}
 				}
 			}
+			List<Map<String, Object>> vtableFields = renameVtableFields(program, family, baseName);
 			commit = true;
-			return functionMap(function);
+			Map<String, Object> result = functionMap(function);
+			result.put("propagated", family.size() > 1);
+			result.put("virtual_family_size", family.size());
+			result.put("renamed_functions", before);
+			result.put("vtable_fields", vtableFields);
+			return result;
 		}
 		finally {
 			program.endTransaction(transaction, commit);
+		}
+	}
+
+	/** Renames applied vtable slot fields that point at any member of a function family. */
+	private static List<Map<String, Object>> renameVtableFields(Program program,
+		List<Function> family, String requestedName) {
+		String fieldName = vtableFieldName(requestedName);
+		Set<String> familyAddresses = new HashSet<>();
+		for (Function function : family) {
+			familyAddresses.add(function.getEntryPoint().toString());
+			if (function.isThunk()) {
+				Function target = function.getThunkedFunction(true);
+				if (target != null) {
+					familyAddresses.add(target.getEntryPoint().toString());
+				}
+			}
+		}
+		Set<String> changedSlots = new HashSet<>();
+		List<Map<String, Object>> changed = new ArrayList<>();
+		for (Map<String, Object> classModel : RttiAnalysisStore.load(program).values()) {
+			for (Map<String, Object> vtable : mapList(classModel.get("vtables"))) {
+				Address vtableAddress = graphAddress(program, vtable.get("address"));
+				if (vtableAddress == null) {
+					continue;
+				}
+				Data data = program.getListing().getDataAt(vtableAddress);
+				if (data == null || !(data.getDataType() instanceof Structure structure)) {
+					continue;
+				}
+				for (Map<String, Object> slot : mapList(vtable.get("slots"))) {
+					int index = integerValue(slot.get("index"), -1);
+					if (index < 0) {
+						continue;
+					}
+					Map<String, Object> function = objectMap(slot.get("function"));
+					Map<String, Object> canonical = objectMap(slot.get("canonical_function"));
+					Address functionAddress = graphAddress(program,
+						function == null ? null : function.get("address"));
+					Address canonicalAddress = graphAddress(program,
+						canonical == null ? null : canonical.get("address"));
+					String functionKey = functionAddress == null ? "" : functionAddress.toString();
+					String canonicalKey = canonicalAddress == null ? "" : canonicalAddress.toString();
+					if (!familyAddresses.contains(functionKey) && !familyAddresses.contains(canonicalKey)) {
+						continue;
+					}
+					DataTypeComponent component;
+					try {
+						component = structure.getComponent(index);
+					}
+					catch (RuntimeException ignored) {
+						continue;
+					}
+					if (component == null) {
+						continue;
+					}
+					String slotKey = structure.getPathName() + ":" + component.getOrdinal();
+					if (!changedSlots.add(slotKey) || fieldName.equals(component.getFieldName())) {
+						continue;
+					}
+					String previousName = component.getFieldName();
+					try {
+						component.setFieldName(fieldName);
+					}
+					catch (RuntimeException ignored) {
+						changedSlots.remove(slotKey);
+						continue;
+					}
+					Map<String, Object> item = new LinkedHashMap<>();
+					item.put("structure", structure.getPathName());
+					item.put("vtable_address", addressMap(vtableAddress));
+					item.put("slot", index);
+					item.put("ordinal", component.getOrdinal());
+					item.put("offset", component.getOffset());
+					item.put("before", previousName);
+					item.put("after", fieldName);
+					changed.add(item);
+				}
+			}
+		}
+		return changed;
+	}
+
+	private static String vtableFieldName(String name) {
+		int separator = name.lastIndexOf(Namespace.NAMESPACE_DELIMITER);
+		return separator < 0 ? name : name.substring(separator + Namespace.NAMESPACE_DELIMITER.length());
+	}
+
+	private static List<Map<String, Object>> restoreVtableFields(Program program,
+		List<Map<String, Object>> fields) {
+		List<Map<String, Object>> changed = new ArrayList<>();
+		for (Map<String, Object> field : fields) {
+			Object rawPath = field.get("structure");
+			int ordinal = integerValue(field.get("ordinal"), -1);
+			if (!(rawPath instanceof String path) || ordinal < 0) {
+				continue;
+			}
+			int separator = path.lastIndexOf('/');
+			if (separator <= 0 || separator == path.length() - 1) {
+				continue;
+			}
+			DataType dataType = program.getDataTypeManager().getDataType(new DataTypePath(
+				path.substring(0, separator), path.substring(separator + 1)));
+			if (!(dataType instanceof Structure structure)) {
+				continue;
+			}
+			DataTypeComponent component;
+			try {
+				component = structure.getComponent(ordinal);
+			}
+			catch (RuntimeException ignored) {
+				continue;
+			}
+			if (component == null) {
+				continue;
+			}
+			String desired = field.get("name") instanceof String name ? name : null;
+			String previousName = component.getFieldName();
+			if (java.util.Objects.equals(previousName, desired)) {
+				continue;
+			}
+			try {
+				component.setFieldName(desired);
+			}
+			catch (RuntimeException ignored) {
+				continue;
+			}
+			Map<String, Object> item = new LinkedHashMap<>();
+			item.put("structure", path);
+			item.put("ordinal", ordinal);
+			item.put("offset", component.getOffset());
+			item.put("before", previousName);
+			item.put("after", desired);
+			changed.add(item);
+		}
+		return changed;
+	}
+
+	private static int integerValue(Object value, int defaultValue) {
+		return value instanceof Number number ? number.intValue() : defaultValue;
+	}
+
+	private static List<Function> virtualFunctionFamily(Program program, Function target) {
+		Map<String, Set<String>> graph = new HashMap<>();
+		Map<String, Address> addresses = new HashMap<>();
+		String targetKey = target.getEntryPoint().toString();
+		for (Map<String, Object> classModel : RttiAnalysisStore.load(program).values()) {
+			for (Map<String, Object> vtable : mapList(classModel.get("vtables"))) {
+				for (Map<String, Object> slot : mapList(vtable.get("slots"))) {
+					Map<String, Object> function = objectMap(slot.get("function"));
+					Address slotAddress = graphAddress(program, function == null ? null : function.get("address"));
+					if (slotAddress == null) {
+						continue;
+					}
+					String slotKey = slotAddress.toString();
+					addresses.put(slotKey, slotAddress);
+					graph.computeIfAbsent(slotKey, ignored -> new HashSet<>());
+					Map<String, Object> canonical = objectMap(slot.get("canonical_function"));
+					Address canonicalAddress = graphAddress(program,
+						canonical == null ? null : canonical.get("address"));
+					if (canonicalAddress != null) {
+						String canonicalKey = canonicalAddress.toString();
+						addresses.put(canonicalKey, canonicalAddress);
+						connect(graph, slotKey, canonicalKey);
+					}
+					for (String relationKey : List.of("parent_relations", "child_relations")) {
+						for (Map<String, Object> relation : mapList(slot.get(relationKey))) {
+							Map<String, Object> related = objectMap(relation.get("function"));
+							Address relatedAddress = graphAddress(program,
+								related == null ? null : related.get("address"));
+							if (relatedAddress != null) {
+								String relatedKey = relatedAddress.toString();
+								addresses.put(relatedKey, relatedAddress);
+								connect(graph, slotKey, relatedKey);
+							}
+						}
+					}
+				}
+			}
+		}
+		if (!graph.containsKey(targetKey)) {
+			return List.of(target);
+		}
+		Set<String> visited = new HashSet<>();
+		Deque<String> pending = new ArrayDeque<>();
+		pending.add(targetKey);
+		while (!pending.isEmpty()) {
+			String current = pending.removeFirst();
+			if (!visited.add(current)) {
+				continue;
+			}
+			for (String neighbor : graph.getOrDefault(current, Set.of())) {
+				if (!visited.contains(neighbor)) {
+					pending.addLast(neighbor);
+				}
+			}
+		}
+		List<Function> result = new ArrayList<>();
+		result.add(target);
+		for (String key : visited) {
+			Address address = addresses.get(key);
+			Function member = address == null ? null : program.getFunctionManager().getFunctionAt(address);
+			if (member != null && member != target && result.stream().noneMatch(existing -> existing.getEntryPoint().equals(address))) {
+				result.add(member);
+			}
+		}
+		return result;
+	}
+
+	private static void connect(Map<String, Set<String>> graph, String left, String right) {
+		graph.computeIfAbsent(left, ignored -> new HashSet<>()).add(right);
+		graph.computeIfAbsent(right, ignored -> new HashSet<>()).add(left);
+	}
+
+	private static Map<String, Object> objectMap(Object value) {
+		return value instanceof Map<?, ?> map ? Json.object(map) : null;
+	}
+
+	private static Address graphAddress(Program program, Object value) {
+		if (value == null) {
+			return null;
+		}
+		try {
+			return addressValue(program, value);
+		}
+		catch (RuntimeException ignored) {
+			return null;
 		}
 	}
 

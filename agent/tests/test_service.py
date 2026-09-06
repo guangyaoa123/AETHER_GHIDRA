@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import unittest
 from http.server import ThreadingHTTPServer
@@ -95,6 +96,8 @@ class ServiceRouteTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(health["ok"])
         self.assertEqual(health["protocol_version"], 2)
+        self.assertEqual(health["pid"], os.getpid())
+        self.assertIsNone(health["bridge_url"])
 
         status, programs = self.request("GET", "/v1/programs")
         self.assertEqual(status, 200)

@@ -20,10 +20,14 @@ final class AgentClient {
 	private final String baseUrl;
 
 	AgentClient() {
+		this(null);
+	}
+
+	AgentClient(String configuredUrl) {
 		httpClient = HttpClient.newBuilder()
 			.connectTimeout(Duration.ofSeconds(2))
 			.build();
-		String configured = System.getenv("AETHER_AGENT_URL");
+		String configured = configuredUrl == null ? System.getenv("AETHER_AGENT_URL") : configuredUrl;
 		baseUrl = (configured == null || configured.isBlank() ? DEFAULT_URL : configured).replaceAll("/$", "");
 	}
 

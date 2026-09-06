@@ -5,11 +5,71 @@ from typing import Any
 
 
 def structured_address(value: Any, label: str = "address") -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise ValueError(f"{label} must be a structured address object")
-    if not str(value.get("space", "")).strip() or not str(value.get("offset", "")).strip():
-        raise ValueError(f"{label} requires non-empty space and offset")
-    return dict(value)
+    """Normalize flexible address spellings into {"space": ..., "offset": ...}.
+
+    Accepted inputs, all unambiguous:
+    - {"space": "ram", "offset": "00542150"} (canonical; space is optional and
+      defaults to the Program's default address space on the Java side)
+    - {"address": {...}} nested wrappers
+    - a JSON string encoding an address object (common double-encoding from
+      LLM tool calls)
+    - "ram:0x542150", "ram:00542150", "0x542150", "00542150"
+    - integer offsets
+    """
+    expected = (f'{label} must be a structured address object like {{"space": "ram", "offset": "00542150"}} '
+                f'or an address string like "ram:0x542150"')
+    value = _unwrap_address_value(value)
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        space = value.get("space")
+        if space is not None and str(space).strip():
+            result["space"] = str(space).strip()
+        result["offset"] = _normalized_offset(value.get("offset"), label, expected)
+        return result
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise ValueError(f"{label} must not be empty; {expected}")
+        if ":" in text:
+            space, _, offset = text.partition(":")
+            result = {"offset": _normalized_offset(offset, label, expected)}
+            if space.strip():
+                result["space"] = space.strip()
+            return result
+        return {"offset": _normalized_offset(text, label, expected)}
+    if isinstance(value, int) and not isinstance(value, bool):
+        return {"offset": format(value, "x")}
+    raise ValueError(f"{expected}; got {type(value).__name__}")
+
+
+def _unwrap_address_value(value: Any) -> Any:
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("{"):
+            try:
+                value = json.loads(text)
+            except json.JSONDecodeError:
+                pass
+    if isinstance(value, dict) and "offset" not in value and "address" in value:
+        return _unwrap_address_value(value["address"])
+    return value
+
+
+def _normalized_offset(value: Any, label: str, expected: str) -> str:
+    if value is None or isinstance(value, bool):
+        raise ValueError(f"{label} requires a non-empty offset; {expected}")
+    if isinstance(value, int):
+        return format(value, "x")
+    text = str(value).strip()
+    if not text:
+        raise ValueError(f"{label} requires a non-empty offset; {expected}")
+    if text.lower().startswith("0x"):
+        text = text[2:].strip()
+    try:
+        int(text, 16)
+    except ValueError:
+        raise ValueError(f"{label} offset '{value}' is not a valid hex offset; {expected}") from None
+    return text
 
 
 def function_address(function_ref: Any) -> dict[str, Any]:

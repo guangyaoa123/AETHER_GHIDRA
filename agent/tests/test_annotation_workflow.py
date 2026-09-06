@@ -116,18 +116,31 @@ class FakeGuidedBridge(FakeAnnotationBridge):
 
 
 class AnnotationWorkflowTests(unittest.TestCase):
-    def test_manual_gatherer_restricts_selection_to_candidates(self) -> None:
+    def test_manual_gatherer_selects_only_requested_candidates(self) -> None:
         bridge = FakeAnnotationBridge()
         workflow = AnnotationWorkflow(bridge, "program-1")
-        selected = workflow._selected_functions(
-            {"selected_functions": [DECODE_REF, {"name": "not-a-candidate"}]},
-            [{"name": "entry", "address": ROOT}, {"name": "decode", "address": CALLEE}],
-            "manual",
-        )
-        self.assertEqual(selected, [
-            {"address": ROOT, "name": "entry"},
-            {"address": CALLEE, "name": "decode"},
-        ])
+        cases = [
+            (
+                {"selected_functions": [DECODE_REF, {"name": "not-a-candidate"}]},
+                [{"name": "entry", "address": ROOT}, {"name": "decode", "address": CALLEE}],
+                [{"address": ROOT, "name": "entry"}, {"address": CALLEE, "name": "decode"}],
+            ),
+            (
+                {"selected_functions": [
+                    {"name": "FUN_00401000", "address": ROOT},
+                    {"name": "FUN_00401100", "address": CALLEE},
+                ]},
+                [
+                    {"name": "FUN_00401000", "address": ROOT, "default_name": True},
+                    {"name": "FUN_00401100", "address": CALLEE, "default_name": True},
+                    {"name": "NamedHelper", "address": {"space": "ram", "offset": "1200"}, "default_name": False},
+                ],
+                [{"address": ROOT, "name": "FUN_00401000"}, {"address": CALLEE, "name": "FUN_00401100"}],
+            ),
+        ]
+        for request, candidates, expected in cases:
+            with self.subTest(candidates=candidates):
+                self.assertEqual(workflow._selected_functions(request, candidates, "manual"), expected)
 
     def test_external_candidates_are_not_decompilable(self) -> None:
         workflow = AnnotationWorkflow(FakeAnnotationBridge(), "program-1")
@@ -143,29 +156,6 @@ class AnnotationWorkflowTests(unittest.TestCase):
         self.assertTrue(workflow._is_decompilable_candidate({
             "name": "decode", "address": ROOT,
         }))
-
-    def test_manual_gatherer_accepts_default_name_preset_selection(self) -> None:
-        workflow = AnnotationWorkflow(FakeAnnotationBridge(), "program-1")
-        candidates = [
-            {"name": "FUN_00401000", "address": ROOT, "default_name": True},
-            {"name": "FUN_00401100", "address": CALLEE, "default_name": True},
-            {"name": "NamedHelper", "address": {"space": "ram", "offset": "1200"}, "default_name": False},
-        ]
-
-        selected = workflow._selected_functions(
-            {"selected_functions": [
-                {"name": item["name"], "address": item["address"]}
-                for item in candidates
-                if item["default_name"]
-            ]},
-            candidates,
-            "manual",
-        )
-
-        self.assertEqual(selected, [
-            {"address": ROOT, "name": "FUN_00401000"},
-            {"address": CALLEE, "name": "FUN_00401100"},
-        ])
 
     def test_annotation_flow_logs_stages_and_bridge_capabilities(self) -> None:
         workflow = AnnotationWorkflow(FakeAnnotationBridge(), "program-1")

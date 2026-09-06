@@ -17,6 +17,7 @@ import ghidra.util.Msg;
 
 import aether.ghidra.observability.DebugLog;
 import aether.ghidra.program.ProgramRegistry;
+import ghidra.program.model.listing.Program;
 
 /** Localhost-only HTTP bridge used by the Python agent service. */
 public final class BridgeServer {
@@ -105,6 +106,16 @@ public final class BridgeServer {
 			server.stop(1);
 			server = null;
 		}
+	}
+
+	/** Registers a Program opened by another GUI tool in the shared bridge registry. */
+	public void registerProgram(Program program) {
+		registry.register(program);
+	}
+
+	/** Removes a Program closed by another GUI tool from the shared bridge registry. */
+	public void unregisterProgram(Program program) {
+		registry.unregister(program);
 	}
 
 	public int getPort() {

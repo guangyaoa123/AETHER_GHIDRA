@@ -4,6 +4,7 @@ import json
 import logging
 import queue
 import threading
+import time
 from typing import Any, Callable
 
 from ...config.settings import load_config
@@ -151,32 +152,71 @@ class FunctionIndexer:
             from openai import OpenAI
         except ImportError as error:
             raise RuntimeError("Indexing requires the openai and httpx packages") from error
+        timeout = max(1.0, float(self.config.get("INDEXING_TIMEOUT_SEC", 1800)))
         return OpenAI(
             api_key=self.config.get("OPENAI_API_KEY"),
             base_url=self.config.get("OPENAI_BASE_URL"),
-            http_client=httpx.Client(verify=False, timeout=600.0),
+            http_client=httpx.Client(verify=False, timeout=timeout),
         )
 
-    def _cancellable_request(self, request: Callable[[], Any]) -> Any:
-        """Keep cancellation responsive while a provider request is blocked."""
-        result: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+    @staticmethod
+    def _retryable(error: BaseException) -> bool:
+        try:
+            from openai import APIConnectionError, APIStatusError
+        except ImportError:
+            return False
+        if isinstance(error, APIConnectionError):
+            return True
+        status = getattr(error, "status_code", 0) or 0
+        return isinstance(error, APIStatusError) and (status == 429 or status >= 500)
 
-        def invoke() -> None:
-            try:
-                result.put((True, request()))
-            except BaseException as error:  # Re-raise provider failures in the worker.
-                result.put((False, error))
+    @staticmethod
+    def _retry_delay(error: BaseException, attempt: int, base_delay: float) -> float:
+        delay = base_delay * (2 ** (attempt - 1))
+        try:
+            retry_after = float(error.response.headers.get("retry-after"))
+        except (AttributeError, TypeError, ValueError):
+            retry_after = 0.0
+        return min(max(delay, retry_after), 120.0)
 
-        threading.Thread(target=invoke, name="aether-index-provider", daemon=True).start()
+    def _sleep_cancellable(self, seconds: float) -> None:
+        deadline = time.monotonic() + max(0.0, seconds)
         while True:
-            try:
-                succeeded, value = result.get(timeout=0.1)
-            except queue.Empty:
-                self._check()
-                continue
+            self._check()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(0.2, remaining))
+
+    def _cancellable_request(self, request: Callable[[], Any]) -> Any:
+        """Keep cancellation responsive while a provider request is blocked and retry transient failures."""
+        max_retries = max(0, int(self.config.get("INDEXING_REQUEST_RETRIES", 5)))
+        base_delay = max(0.0, float(self.config.get("INDEXING_RETRY_DELAY_SEC", 2.0)))
+        attempt = 0
+        while True:
+            result: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+            def invoke() -> None:
+                try:
+                    result.put((True, request()))
+                except BaseException as error:  # Re-raise provider failures in the worker.
+                    result.put((False, error))
+
+            threading.Thread(target=invoke, name="aether-index-provider", daemon=True).start()
+            while True:
+                try:
+                    succeeded, value = result.get(timeout=0.1)
+                    break
+                except queue.Empty:
+                    self._check()
             if succeeded:
                 return value
-            raise value
+            attempt += 1
+            if attempt > max_retries or not self._retryable(value):
+                raise value
+            delay = self._retry_delay(value, attempt, base_delay)
+            logger.warning("index provider request failed retry=%d/%d error=%s; retrying in %.1fs", attempt, max_retries, value, delay)
+            self._sleep_cancellable(delay)
 
     def _classify(self, batch: list[dict[str, Any]], pseudocode: dict[str, str], index: FunctionIndex, tags: DynamicTagManager) -> list[FunctionEntry]:
         tag_lines = "\n".join(f"- {key}: {value}" for key, value in DEFAULT_FUNCTION_TAGS.items())
@@ -211,6 +251,15 @@ Functions:\n{chr(10).join(sections)}"""
         tool_calls = getattr(message, "tool_calls", None) or []
         logger.info("index classification response tool_calls=%d batch=%d", len(tool_calls), len(batch))
         if not tool_calls:
+            choice = response.choices[0]
+            content = (getattr(message, "content", None) or "").strip()
+            logger.warning(
+                "index classification returned no tool calls batch=%d finish_reason=%s completion_tokens=%s content=%r",
+                len(batch),
+                getattr(choice, "finish_reason", None),
+                getattr(getattr(response, "usage", None), "completion_tokens", None),
+                content[:200],
+            )
             for canonical, item in valid_addresses.items():
                 index.llm_failed_entries[canonical] = {
                     "name": str(item.get("name", "")),
@@ -396,19 +445,23 @@ Functions:\n{chr(10).join(sections)}"""
                 for entry in entries:
                     index.add_entry(entry)
                 if not entries:
-                    index.indexing_state = "PARTIAL"
                     index.batch_metadata.last_error = f"No valid classifier entries returned for batch {batch_number}"
                     FunctionIndexManager.save(index)
-                    raise RuntimeError(index.batch_metadata.last_error)
+                    logger.warning("index batch %d/%d returned no classifier entries; %d functions queued for retry", batch_number, len(batches), len(batch))
+                    continue
                 index.batch_metadata.completed_batches = batch_number
                 index.batch_metadata.indexed_functions = index.size()
                 index.indexing_progress = 35 + int(batch_number / max(len(batches), 1) * 60)
                 index.last_indexed_address = entries[-1].address if entries else index.last_indexed_address
-            except Exception as error:
-                index.indexing_state = "PARTIAL"
-                index.batch_metadata.last_error = str(error)
-                FunctionIndexManager.save(index)
+            except IndexCancelled:
                 raise
+            except Exception as error:
+                for item in batch:
+                    index.llm_failed_entries[address_key(item["address"])] = {"name": str(item.get("name", "")), "reason": "provider_error"}
+                index.batch_metadata.last_error = f"Provider request failed for batch {batch_number}: {error}"
+                FunctionIndexManager.save(index)
+                logger.warning("index batch %d/%d provider request failed; %d functions queued for retry: %s", batch_number, len(batches), len(batch), error)
+                continue
             index.dynamic_tags = tags.to_dict()
             FunctionIndexManager.save(index)
 
@@ -419,7 +472,12 @@ Functions:\n{chr(10).join(sections)}"""
         for start in range(0, len(unknown_entries), 40):
             self._check()
             self._update(index, "RESOLVING_UNKNOWNS", batch=start // 40 + 1)
-            self._resolve_unknowns(unknown_entries[start:start + 40], tags)
+            try:
+                self._resolve_unknowns(unknown_entries[start:start + 40], tags)
+            except IndexCancelled:
+                raise
+            except Exception as error:
+                logger.warning("index unknown-category resolution failed: %s", error)
         index.dynamic_tags = tags.to_dict()
 
         for attempt in range(self.max_retries):
@@ -430,8 +488,14 @@ Functions:\n{chr(10).join(sections)}"""
             self._update(index, "RETRYING_FAILED_ENTRIES", attempt=attempt + 1, failed=before)
             for start in range(0, len(failed), self.batch_size):
                 self._check()
-                for entry in self._classify(failed[start:start + self.batch_size], pseudocode, index, tags):
-                    index.add_entry(entry)
+                try:
+                    for entry in self._classify(failed[start:start + self.batch_size], pseudocode, index, tags):
+                        index.add_entry(entry)
+                except IndexCancelled:
+                    raise
+                except Exception as error:
+                    logger.warning("index retry pass failed attempt=%d: %s", attempt + 1, error)
+                    break
                 index.dynamic_tags = tags.to_dict()
                 FunctionIndexManager.save(index)
             if len([item for item in functions if address_key(item["address"]) in index.llm_failed_entries]) >= before:

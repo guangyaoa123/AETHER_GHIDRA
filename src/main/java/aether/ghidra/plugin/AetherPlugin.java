@@ -8,6 +8,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.net.BindException;
+import java.net.ServerSocket;
 
 import javax.swing.SwingUtilities;
 
@@ -40,6 +42,8 @@ import ghidra.program.model.address.AddressSpace;
 import ghidra.program.util.AddressFieldLocation;
 import ghidra.program.util.GhidraProgramUtilities;
 import ghidra.program.util.ProgramEvent;
+import ghidra.program.util.ProgramChangeRecord;
+import ghidra.program.model.symbol.Symbol;
 import ghidra.util.Msg;
 import ghidra.util.task.TaskMonitor;
 import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
@@ -74,6 +78,23 @@ import aether.ghidra.plugin.ui.IndexProvider;
 )
 public class AetherPlugin extends Plugin implements PopupActionProvider {
 	private static final int DEFAULT_PORT = 8765;
+	private static final String DEFAULT_AGENT_URL = "http://127.0.0.1:8780";
+	private static final Object SHARED_BRIDGE_LOCK = new Object();
+	private static SharedBridge sharedBridge;
+
+	private static final class SharedBridge {
+		private final BridgeServer server;
+		private final ProgramRegistry registry;
+		private int users;
+		private AgentProcess managedAgent;
+		private String agentUrl;
+
+		private SharedBridge(BridgeServer server, ProgramRegistry registry) {
+			this.server = server;
+			this.registry = registry;
+			this.users = 1;
+		}
+	}
 
 	private ProgramRegistry registry;
 	private BridgeServer bridgeServer;
@@ -93,6 +114,8 @@ public class AetherPlugin extends Plugin implements PopupActionProvider {
 	private IndexProvider indexProvider;
 	private ClassInfoProvider classInfoProvider;
 	private final Map<Program, DomainObjectListener> programListeners = new IdentityHashMap<>();
+	private final Set<Program> guiRenamePropagation =
+		Collections.newSetFromMap(new IdentityHashMap<>());
 	private final Set<Program> rttiRecoveryScheduled =
 		Collections.newSetFromMap(new IdentityHashMap<>());
 
@@ -110,9 +133,9 @@ public class AetherPlugin extends Plugin implements PopupActionProvider {
 
 		int port = readPort();
 		DebugLog.debug(this, "configured bridge port=" + port);
-		bridgeServer = new BridgeServer(registry, port);
-		bridgeServer.start();
-		agentClient = new AgentClient();
+		bridgeServer = acquireSharedBridge(registry, port);
+		String agentUrl = acquireSharedAgentUrl(bridgeServer, port);
+		agentClient = new AgentClient(agentUrl);
 		chatProvider = new ChatProvider(tool, getName(), new ChatProvider.Backend() {
 			@Override
 			public Map<String, Object> startChat(String programId, String message, Map<String, Object> address) {
@@ -243,6 +266,7 @@ public class AetherPlugin extends Plugin implements PopupActionProvider {
 		ProgramManager programManager = tool.getService(ProgramManager.class);
 		if (programManager != null) {
 			for (Program openProgram : programManager.getAllOpenPrograms()) {
+				bridgeServer.registerProgram(openProgram);
 				attachProgramListener(openProgram);
 				scheduleRttiRecovery(openProgram);
 			}
@@ -267,12 +291,15 @@ public class AetherPlugin extends Plugin implements PopupActionProvider {
 				}
 			}
 		});
-		agentProcess = new AgentProcess(tool);
-		try {
-			agentProcess.start(bridgeServer.getPort());
-		}
-		catch (RuntimeException e) {
-			Msg.error(this, "Could not start the AETHER Python agent", e);
+		agentProcess = new AgentProcess(tool, agentUrl);
+		synchronized (SHARED_BRIDGE_LOCK) {
+			try {
+				agentProcess.start(bridgeServer.getPort());
+				registerManagedAgent(bridgeServer, agentProcess);
+			}
+			catch (RuntimeException e) {
+				Msg.error(this, "Could not start the AETHER Python agent", e);
+			}
 		}
 		DebugLog.debug(this, "plugin initialization complete");
 		createAnalyzeAction();
@@ -337,6 +364,7 @@ public class AetherPlugin extends Plugin implements PopupActionProvider {
 		if (event instanceof ProgramOpenedPluginEvent opened) {
 			DebugLog.debug(this, "program opened");
 			registry.register(opened.getProgram());
+			bridgeServer.registerProgram(opened.getProgram());
 			attachProgramListener(opened.getProgram());
 			scheduleRttiRecovery(opened.getProgram());
 		}
@@ -357,6 +385,7 @@ public class AetherPlugin extends Plugin implements PopupActionProvider {
 				rttiRecoveryScheduled.remove(closed.getProgram());
 			}
 			registry.unregister(closed.getProgram());
+			bridgeServer.unregisterProgram(closed.getProgram());
 		}
 		else if (event instanceof ProgramActivatedPluginEvent activated) {
 			DebugLog.debug(this, "program activated");
@@ -503,18 +532,19 @@ public class AetherPlugin extends Plugin implements PopupActionProvider {
 		if (configAction != null) {
 			configAction = null;
 		}
-		if (agentProcess != null) {
-			agentProcess.stop();
-			agentProcess = null;
-		}
+		boolean sharedRegistryManaged = false;
 		if (bridgeServer != null) {
-			bridgeServer.stop();
+			sharedRegistryManaged = releaseSharedBridge(bridgeServer, registry);
 			bridgeServer = null;
 		}
-		if (registry != null) {
-			registry.close();
-			registry = null;
+		if (agentProcess != null && !sharedRegistryManaged) {
+			agentProcess.stop();
 		}
+		agentProcess = null;
+		if (registry != null && !sharedRegistryManaged) {
+			registry.close();
+		}
+		registry = null;
 		super.dispose();
 	}
 
@@ -523,6 +553,7 @@ public class AetherPlugin extends Plugin implements PopupActionProvider {
 			return;
 		}
 		DomainObjectListener listener = event -> {
+			propagateGuiVirtualRenames(program, event);
 			if (!isClassInformationChange(event)) {
 				return;
 			}
@@ -535,6 +566,31 @@ public class AetherPlugin extends Plugin implements PopupActionProvider {
 		};
 		program.addListener(listener);
 		programListeners.put(program, listener);
+	}
+
+	private void propagateGuiVirtualRenames(Program program, DomainObjectChangedEvent event) {
+		if (guiRenamePropagation.contains(program) || registry == null || !event.contains(ProgramEvent.SYMBOL_RENAMED)) {
+			return;
+		}
+		event.forEach(ProgramEvent.SYMBOL_RENAMED, record -> {
+			if (!(record instanceof ProgramChangeRecord change) || !(change.getObject() instanceof Symbol symbol) ||
+				symbol.getSymbolType() != ghidra.program.model.symbol.SymbolType.FUNCTION) {
+				return;
+			}
+			try {
+				guiRenamePropagation.add(program);
+				int propagated = registry.propagateVirtualRename(program, change.getStart());
+				if (propagated > 0) {
+					tool.setStatusInfo("AETHER propagated virtual rename to " + (propagated + 1) + " functions");
+				}
+			}
+			catch (Exception error) {
+				Msg.warn(this, "AETHER could not propagate virtual rename: " + error.getMessage());
+			}
+			finally {
+				guiRenamePropagation.remove(program);
+			}
+		});
 	}
 
 	private void scheduleClassGraphRefresh(Program program, String programId) {
@@ -976,6 +1032,107 @@ public class AetherPlugin extends Plugin implements PopupActionProvider {
 				});
 				return null;
 			});
+	}
+
+	private static BridgeServer acquireSharedBridge(ProgramRegistry registry, int port) {
+		synchronized (SHARED_BRIDGE_LOCK) {
+			if (sharedBridge != null) {
+				sharedBridge.users++;
+				DebugLog.debug(AetherPlugin.class,
+					"reusing shared bridge port=" + sharedBridge.server.getPort() + " users=" + sharedBridge.users);
+				return sharedBridge.server;
+			}
+			BridgeServer server = new BridgeServer(registry, port);
+			try {
+				server.start();
+			}
+			catch (IllegalStateException error) {
+				if (port != DEFAULT_PORT || hasConfiguredBridgePort() || !isAddressInUse(error)) {
+					throw error;
+				}
+				server = new BridgeServer(registry, 0);
+				server.start();
+				Msg.warn(AetherPlugin.class,
+					"AETHER bridge port " + DEFAULT_PORT + " is busy; using port " + server.getPort());
+			}
+			sharedBridge = new SharedBridge(server, registry);
+			return server;
+		}
+	}
+
+	private static String acquireSharedAgentUrl(BridgeServer server, int requestedBridgePort) {
+		synchronized (SHARED_BRIDGE_LOCK) {
+			if (sharedBridge == null || sharedBridge.server != server) {
+				throw new IllegalStateException("AETHER shared bridge is not registered");
+			}
+			if (sharedBridge.agentUrl == null) {
+				String configured = System.getenv("AETHER_AGENT_URL");
+				if (configured != null && !configured.isBlank()) {
+					sharedBridge.agentUrl = configured.replaceAll("/$", "");
+				}
+				else if (server.getPort() != requestedBridgePort ||
+					(AgentProcess.isPortInUse(DEFAULT_AGENT_URL) && !AgentProcess.isHealthyAt(DEFAULT_AGENT_URL))) {
+					sharedBridge.agentUrl = "http://127.0.0.1:" + findFreePort();
+					Msg.warn(AetherPlugin.class,
+						"AETHER agent port 8780 is busy or incompatible; using port " + sharedBridge.agentUrl);
+				}
+				else {
+					sharedBridge.agentUrl = DEFAULT_AGENT_URL;
+				}
+			}
+			return sharedBridge.agentUrl;
+		}
+	}
+
+	private static void registerManagedAgent(BridgeServer server, AgentProcess agent) {
+		synchronized (SHARED_BRIDGE_LOCK) {
+			if (sharedBridge != null && sharedBridge.server == server && agent.isManaged()) {
+				sharedBridge.managedAgent = agent;
+			}
+		}
+	}
+
+	private static boolean releaseSharedBridge(BridgeServer server, ProgramRegistry localRegistry) {
+		synchronized (SHARED_BRIDGE_LOCK) {
+			if (sharedBridge == null || sharedBridge.server != server) {
+				return false;
+			}
+			boolean sharedRegistryManaged = sharedBridge.registry == localRegistry;
+			sharedBridge.users--;
+			if (sharedBridge.users > 0) {
+				return sharedRegistryManaged;
+			}
+			if (sharedBridge.managedAgent != null) {
+				sharedBridge.managedAgent.stop();
+			}
+			server.stop();
+			sharedBridge.registry.close();
+			sharedBridge = null;
+			return true;
+		}
+	}
+
+	private static boolean hasConfiguredBridgePort() {
+		String configured = System.getenv("AETHER_GHIDRA_PORT");
+		return configured != null && !configured.isBlank();
+	}
+
+	private static boolean isAddressInUse(Throwable error) {
+		for (Throwable current = error; current != null; current = current.getCause()) {
+			if (current instanceof BindException) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private static int findFreePort() {
+		try (ServerSocket socket = new ServerSocket(0)) {
+			return socket.getLocalPort();
+		}
+		catch (Exception error) {
+			throw new IllegalStateException("Could not find a free AETHER agent port", error);
+		}
 	}
 
 	private static int readPort() {

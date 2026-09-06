@@ -24,6 +24,11 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no fcntl
+    fcntl = None
+
 from ..integrations.ghidra.bridge_client import BridgeClient, BridgeError
 
 
@@ -64,6 +69,26 @@ def _optional_int(arguments: dict[str, Any], name: str, default: int) -> int:
         return int(value)
     except (TypeError, ValueError) as error:
         raise MCPServerError(f"{name} must be an integer", code="invalid_argument") from error
+
+
+def _optional_int_from_environment(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _environment_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        return default
 
 
 def _json_text(value: Any) -> str:
@@ -190,6 +215,7 @@ class ImportJob:
     progress: dict[str, Any] = field(default_factory=lambda: structured_progress(None, "queued"))
     result: dict[str, Any] | None = None
     error: str | None = None
+    error_code: str | None = None
     phase: str = "QUEUED"
     message: str = "Queued"
     last_update: float = field(default_factory=time.time)
@@ -339,13 +365,29 @@ class AnalysisBroker:
             return []
         paths = value.get("projects", []) if isinstance(value, dict) else []
         result: list[Path] = []
+        loaded: list[Path] = []
         for item in paths:
             path = item if isinstance(item, str) else item.get("gpr_path") if isinstance(item, dict) else None
             if isinstance(path, str) and path.strip():
                 candidate = Path(path).expanduser().resolve()
+                loaded.append(candidate)
                 if candidate not in result:
-                    result.append(candidate)
+                    if candidate.is_file():
+                        result.append(candidate)
+        if result != loaded:
+            self._write_project_manifest(result)
         return result
+
+    def _write_project_manifest(self, projects: list[Path] | None = None) -> None:
+        entries = projects if projects is not None else self._saved_projects
+        payload = {"projects": [{"gpr_path": str(path)} for path in entries]}
+        try:
+            self._manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self._manifest_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+            temporary.replace(self._manifest_path)
+        except OSError as error:
+            self._diagnostic(f"could not write project manifest: {error}")
 
     def _persist_project(self, project: ProjectHandle) -> None:
         gpr_path = (project.path / f"{project.name}.gpr").resolve()
@@ -353,11 +395,18 @@ class AnalysisBroker:
             return
         if gpr_path not in self._saved_projects:
             self._saved_projects.append(gpr_path)
-        payload = {"projects": [{"gpr_path": str(path)} for path in self._saved_projects]}
-        self._manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self._manifest_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-        temporary.replace(self._manifest_path)
+        self._write_project_manifest()
+
+    def forget_project(self, gpr_path: str) -> dict[str, Any]:
+        target = Path(gpr_path).expanduser().resolve()
+        before = len(self._saved_projects)
+        self._saved_projects = [path for path in self._saved_projects if path != target]
+        self._write_project_manifest()
+        return {
+            "gpr_path": str(target),
+            "forgotten": len(self._saved_projects) != before,
+            "remaining_projects": [str(path) for path in self._saved_projects],
+        }
 
     @staticmethod
     def _project_from_gpr(gpr_path: Path) -> ProjectHandle:
@@ -484,6 +533,7 @@ class AnalysisBroker:
         return result
 
     def list_sessions(self) -> list[dict[str, Any]]:
+        self._reap_orphan_leases()
         self._reconcile_sessions()
         self.interactive()
         with self._lock:
@@ -500,14 +550,30 @@ class AnalysisBroker:
                 return self._startup_snapshot()
             interactive = self.interactive()
             try:
-                health = interactive.bridge.health()
+                health = self._interactive_bridge_health()
             except BridgeError:
                 interactive.bridge_status = "unavailable"
                 interactive.ready = False
                 try:
+                    if self._gui_ghidra_running():
+                        self._startup_state = {
+                            "state": "gui_bridge_unavailable",
+                            "mode": "interactive",
+                            "message": "A GUI Ghidra instance is running; headless auto-restore is paused until its AETHER bridge is ready.",
+                        }
+                        return self._startup_snapshot()
                     saved = next((path for path in reversed(self._saved_projects) if path.is_file()), None)
                     if saved is not None:
                         project = self._project_from_gpr(saved)
+                        conflict = self._project_lock_conflict(saved)
+                        if conflict is not None:
+                            self._startup_state = {
+                                "state": "project_locked",
+                                "mode": "headless",
+                                "project": project.as_dict(),
+                                "lock_path": str(conflict),
+                            }
+                            return self._startup_snapshot()
                         with self._lock:
                             self._projects[project.project_id] = project
                         job = self._start_saved_project(project)
@@ -551,6 +617,7 @@ class AnalysisBroker:
             return self._startup_snapshot()
 
     def _start_saved_project(self, project: ProjectHandle) -> dict[str, Any]:
+        self._raise_if_project_locked(project)
         job = ImportJob(str(uuid.uuid4()), Path("."), {"project_id": project.project_id, "resume": True})
         with self._lock:
             self._import_jobs[job.job_id] = job
@@ -582,6 +649,71 @@ class AnalysisBroker:
                         state["state"] = "failed"
                         state["error"] = current.get("error")
         return state
+
+    def _interactive_bridge_health(self) -> dict[str, Any]:
+        retries = max(0, _optional_int_from_environment("AETHER_MCP_BRIDGE_RETRIES", 5))
+        interval = _environment_float("AETHER_MCP_BRIDGE_RETRY_INTERVAL", 0.5)
+        last_error: BridgeError | None = None
+        for attempt in range(retries + 1):
+            try:
+                return self.interactive().bridge.health()
+            except BridgeError as error:
+                last_error = error
+                if attempt < retries:
+                    self.sleep(interval)
+        assert last_error is not None
+        raise last_error
+
+    @staticmethod
+    def _gui_ghidra_running() -> bool:
+        if os.name == "nt":
+            return False
+        proc_root = Path("/proc")
+        try:
+            entries = list(proc_root.iterdir())
+        except OSError:
+            return False
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            try:
+                command_line = entry.joinpath("cmdline").read_bytes().decode(errors="replace")
+            except OSError:
+                continue
+            if "ghidra.GhidraRun" in command_line and "AnalyzeHeadless" not in command_line:
+                return True
+        return False
+
+    @staticmethod
+    def _project_lock_conflict(gpr_path: Path) -> Path | None:
+        lock_path = gpr_path.with_suffix(".lock")
+        if not lock_path.exists():
+            return None
+        if fcntl is None:
+            return lock_path
+        try:
+            descriptor = os.open(lock_path, os.O_RDWR)
+        except OSError:
+            return lock_path
+        try:
+            try:
+                fcntl.lockf(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (BlockingIOError, OSError):
+                return lock_path
+            else:
+                fcntl.lockf(descriptor, fcntl.LOCK_UN)
+                return None
+        finally:
+            os.close(descriptor)
+
+    @classmethod
+    def _raise_if_project_locked(cls, project: ProjectHandle) -> None:
+        lock_path = cls._project_lock_conflict(project.path / f"{project.name}.gpr")
+        if lock_path is not None:
+            raise MCPServerError(
+                f"Ghidra project is already locked: {lock_path}",
+                code="project_locked",
+            )
 
     def create_project(self, path: str, name: str) -> ProjectHandle:
         if self._active_project_session(required=False) is not None:
@@ -764,8 +896,18 @@ class AnalysisBroker:
             job.last_update = time.time()
             job.backend_alive = True
             job.state = "completed"
+        except MCPServerError as error:
+            job.error = str(error)
+            job.error_code = error.code
+            job.progress = structured_progress({"phase": "FAILED", "message": str(error)}, "failed")
+            job.phase = "FAILED"
+            job.message = str(error)
+            job.last_update = time.time()
+            job.backend_alive = False
+            job.state = "failed"
         except Exception as error:
             job.error = str(error)
+            job.error_code = "project_locked" if self._looks_like_project_lock(str(error)) else "mcp_error"
             job.progress = structured_progress({"phase": "FAILED", "message": str(error)}, "failed")
             job.phase = "FAILED"
             job.message = str(error)
@@ -803,7 +945,13 @@ class AnalysisBroker:
             result["result"] = job.result
         if job.error is not None:
             result["error"] = job.error
+            result["error_code"] = job.error_code
         return result
+
+    @staticmethod
+    def _looks_like_project_lock(message: str) -> bool:
+        lowered = message.lower()
+        return "lock" in lowered and ("project" in lowered or "gpr" in lowered or "already open" in lowered)
 
     def _import_interactive(self, session: AnalysisSession, binary: Path) -> dict[str, Any]:
         result = session.bridge.import_program(str(binary))
@@ -900,6 +1048,7 @@ class AnalysisBroker:
         project: ProjectHandle,
         progress: Callable[..., None] | None = None,
     ) -> dict[str, Any]:
+        self._raise_if_project_locked(project)
         if progress:
             progress("STARTING_GHIDRA", "Launching headless Ghidra")
         bridge_port = int(arguments.get("bridge_port") or self.port_factory())
@@ -1156,7 +1305,10 @@ class AnalysisBroker:
         for session in sessions:
             session.closed = True
             self._pause_index_jobs(session)
-            self._save_session(session)
+            try:
+                self._save_session(session)
+            except Exception as error:
+                self._diagnostic(f"could not save session before shutdown: {error}")
             self._terminate(session.process)
             self._remove_lease(session)
         self._startup_state = None
@@ -1215,6 +1367,8 @@ class AnalysisBroker:
                 payload = json.loads(lease.read_text(encoding="utf-8"))
                 owner_pid = int(payload["owner_pid"])
                 process_pid = int(payload["process_pid"])
+                if owner_pid < 1 or process_pid < 1:
+                    raise ValueError("lease contains an invalid process id")
                 os.kill(owner_pid, 0)
             except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
                 owner_alive = False
@@ -1222,17 +1376,42 @@ class AnalysisBroker:
                 owner_alive = True
             if owner_alive:
                 continue
+            process_alive = False
             try:
                 if os.name != "nt":
                     os.killpg(process_pid, signal.SIGTERM)
                 else:
                     os.kill(process_pid, signal.SIGTERM)
+                process_alive = self._process_group_alive(process_pid)
             except OSError:
                 pass
+            deadline = time.monotonic() + 2.0
+            while process_alive and time.monotonic() < deadline:
+                self.sleep(0.1)
+                process_alive = self._process_group_alive(process_pid)
+            if process_alive:
+                try:
+                    if os.name != "nt":
+                        os.killpg(process_pid, signal.SIGKILL)
+                    else:
+                        os.kill(process_pid, signal.SIGKILL)
+                except OSError:
+                    pass
             try:
                 lease.unlink(missing_ok=True)
             except OSError:
                 pass
+
+    @staticmethod
+    def _process_group_alive(process_pid: int) -> bool:
+        try:
+            if os.name != "nt":
+                os.killpg(process_pid, 0)
+            else:
+                os.kill(process_pid, 0)
+        except OSError:
+            return False
+        return True
 
     def _save_session(self, session: AnalysisSession) -> list[dict[str, Any]]:
         """Flush every Program before a managed headless process is stopped."""
@@ -1380,6 +1559,7 @@ TOOLS = [
     _tool("list_programs", "List every Program stored in the open project, including open and closed state.", {"type": "object", "properties": {}, "additionalProperties": False}),
     _tool("create_project", "Create a new, non-overwriting Ghidra project directory and return its handle.", {"type": "object", "properties": {"path": {"type": "string"}, "name": {"type": "string"}, "project_path": {"type": "string"}, "project_name": {"type": "string"}}, "anyOf": [{"required": ["path", "name"]}, {"required": ["project_path", "project_name"]}], "additionalProperties": False}),
     _tool("open_project", "Open an existing Ghidra project.", {"type": "object", "properties": {"gpr_path": {"type": "string"}, "path": {"type": "string"}, "name": {"type": "string"}, "project_path": {"type": "string"}, "project_name": {"type": "string"}}, "anyOf": [{"required": ["gpr_path"]}, {"required": ["path", "name"]}, {"required": ["project_path", "project_name"]}], "additionalProperties": False}),
+    _tool("forget_project", "Remove an existing Ghidra project from MCP auto-restore history without deleting the project.", {"type": "object", "properties": {"gpr_path": {"type": "string"}}, "required": ["gpr_path"], "additionalProperties": False}),
     _tool("close_project", "Save all open Programs and close the one open Ghidra project.", {"type": "object", "properties": {}, "additionalProperties": False}),
     _tool("open_program", "Open one stored Program by its Ghidra project-domain path.", {"type": "object", "properties": {"program_id": {"type": "string"}}, "required": ["program_id"], "additionalProperties": False}),
     _tool("close_program", "Save and close one Program while keeping its project open.", {"type": "object", "properties": {"program_id": {"type": "string"}}, "required": ["program_id"], "additionalProperties": False}),
@@ -1407,13 +1587,12 @@ TOOLS = [
     _tool("get_function_index_stats", "Return persisted function index statistics.", _program_schema({})),
     _tool("list_function_index_entries", "List a page of persisted function index entries.", _program_schema({"offset": {"type": "integer"}, "limit": {"type": "integer"}})),
     _tool("search_function_index", "Search the persisted function index.", _program_schema({"query": {"type": "string"}}, ["query"])),
-    _tool("rename_function", "Rename the exact function identified by address. A name containing '::' is split on the last '::': the prefix becomes a hierarchically resolved-or-created namespace path and the suffix becomes the function name (e.g. 'Sexy::Fish::update' places update in namespace Sexy::Fish). A plain name keeps the current namespace.", _program_schema({"address": ADDRESS_SCHEMA, "name": {"type": "string"}}, ["address", "name"])),
+    _tool("rename_function", "Rename the exact function identified by address and synchronize matching fields in applied related vtable structures. Verified virtual-function families are renamed in both parent and child directions by default. Set propagate_virtual to false to rename only the target. A name containing '::' is split on the last '::': the prefix becomes a hierarchically resolved-or-created namespace path and the suffix becomes the function name.", _program_schema({"address": ADDRESS_SCHEMA, "name": {"type": "string"}, "propagate_virtual": {"type": "boolean"}}, ["address", "name"])),
     _tool("rename_variable", "Rename a local or parameter variable in the exact function address.", _program_schema({"address": ADDRESS_SCHEMA, "variable_name": {"type": "string"}, "name": {"type": "string"}}, ["address", "variable_name", "name"])),
     _tool("retype_variable", "Change a local or parameter variable data type for the exact function address.", _program_schema({"address": ADDRESS_SCHEMA, "variable_name": {"type": "string"}, "data_type_path": {"type": "string"}}, ["address", "variable_name", "data_type_path"])),
     _tool("update_function_definition", "Replace the exact function return type, ordered parameters, and varargs setting by address.", _program_schema({"address": ADDRESS_SCHEMA, "return_type": {"type": "string"}, "parameters": {"type": "array", "items": PARAMETER_SCHEMA}, "varargs": {"type": "boolean"}}, ["address", "return_type", "parameters"])),
     _tool("set_function_comment", "Set or clear the exact function comment by address.", _program_schema({"address": ADDRESS_SCHEMA, "comment": {"type": "string"}}, ["address", "comment"])),
     _tool("set_code_unit_comment", "Set or clear a comment on the exact code unit at an address.", _program_schema({"location": ADDRESS_SCHEMA, "comment_kind": {"type": "string", "enum": ["eol", "pre", "post", "plate", "repeatable"]}, "comment": {"type": "string"}}, ["location", "comment_kind", "comment"])),
-    _tool("apply_annotation_batch", "Apply multiple function, variable, definition, and comment edits atomically.", _program_schema({"operations": {"type": "array", "items": {"type": "object"}}}, ["operations"])),
     _tool("create_struct", "Create a native Ghidra structure.", _program_schema({"name": {"type": "string"}, "category": {"type": "string"}, "size": {"type": "integer"}, "fields": {"type": "array", "items": FIELD_SCHEMA}}, ["name"])),
     _tool("add_fields", "Insert fields at byte offsets; fields at or after each offset shift up and the structure grows by the inserted length. Batch entries are applied in descending offset order so all offsets refer to the original layout. Offsets must land on field boundaries, not inside an existing field.", _program_schema({"structure_path": {"type": "string"}, "fields": {"type": "array", "items": FIELD_SCHEMA}}, ["structure_path", "fields"])),
     _tool("update_fields", "Update fields in place without changing the structure size. An offset holding a defined field is replaced in place; an offset inside a field is rejected; an offset in a gap defines a new field there, replacing any field it overlaps (reported under 'replaced'). Never grows or shrinks the structure.", _program_schema({"structure_path": {"type": "string"}, "fields": {"type": "array", "items": UPDATE_FIELD_SCHEMA}}, ["structure_path", "fields"])),
@@ -1597,8 +1776,10 @@ class MCPApplication:
             if error.code == "invalid_argument":
                 raise
             return self.tool_error(str(error), error.code)
-        except (BridgeError, AgentAPIError, KeyError, TypeError, ValueError) as error:
+        except (BridgeError, AgentAPIError) as error:
             return self.tool_error(str(error), getattr(error, "code", "backend_error"))
+        except (KeyError, TypeError, ValueError) as error:
+            return self.tool_error(str(error), "invalid_argument")
         return {
             "content": [{"type": "text", "text": _json_text(value)}],
             "isError": False,
@@ -1683,6 +1864,8 @@ class MCPApplication:
                 raise MCPServerError("name or project_name is required", code="invalid_argument")
             project = self.sessions.open_project(path, project_name)
             return self.sessions.open_project_backend(project)
+        if name == "forget_project":
+            return self.sessions.forget_project(_required_string(arguments, "gpr_path"))
         if name == "close_project":
             return self.sessions.close_project()
         if name == "open_program":
@@ -1713,7 +1896,7 @@ class MCPApplication:
             "get_data_at_address", "get_xrefs_to", "list_struct", "get_struct",
             "save_program",
             "rename_function", "rename_variable", "retype_variable", "update_function_definition",
-            "set_function_comment", "set_code_unit_comment", "apply_annotation_batch",
+            "set_function_comment", "set_code_unit_comment",
             "create_struct", "add_fields", "update_fields", "remove_fields", "resize_struct",
             "create_class", "update_class", "delete_class",
         }:
@@ -1772,6 +1955,24 @@ def serve_stdio(
     input_stream = input_stream or sys.stdin
     output_stream = output_stream or sys.stdout
     application = application or MCPApplication()
+
+    shutting_down = False
+
+    def shutdown(_signum: int, _frame: Any) -> None:
+        nonlocal shutting_down
+        if shutting_down:
+            return
+        shutting_down = True
+        application.sessions.close_all()
+        raise SystemExit(0)
+
+    previous_handlers: dict[int, Any] = {}
+    if threading.current_thread() is threading.main_thread():
+        for signal_name in ("SIGTERM", "SIGINT"):
+            shutdown_signal = getattr(signal, signal_name, None)
+            if shutdown_signal is not None:
+                previous_handlers[shutdown_signal] = signal.getsignal(shutdown_signal)
+                signal.signal(shutdown_signal, shutdown)
     try:
         for line in input_stream:
             if not line.strip():
@@ -1787,6 +1988,8 @@ def serve_stdio(
                 output_stream.flush()
     finally:
         application.sessions.close_all()
+        for shutdown_signal, previous_handler in previous_handlers.items():
+            signal.signal(shutdown_signal, previous_handler)
 
 
 def main() -> None:

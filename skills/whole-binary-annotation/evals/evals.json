@@ -1,0 +1,50 @@
+{
+  "skill_name": "whole-binary-annotation",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Import the supplied stripped C++ fixture into Ghidra through AETHER and perform a complete whole-binary annotation. Rename all application functions appropriately, preserve runtime/library functions, recover its classes, virtual methods, and high-confidence object fields, and keep a resumable PROGRESS.md. Continue until every function and structure candidate has a recorded disposition. Save PROGRESS.md and a compact verification.json listing the final function names and recovered structures to the output directory.",
+      "expected_output": "A complete, resumable annotation of the C++ fixture with namespace-aware methods, consistent virtual-family names, conservative comments, recovered object fields, and complete coverage accounting.",
+      "files": [
+        "evals/files/cpp_virtual_fixture"
+      ],
+      "expectations": [
+        "PROGRESS.md exists and records a disposition for every discovered function with zero default-named application functions remaining",
+        "verification.json is valid JSON listing final function names and recovered structures",
+        "Virtual-family methods share consistent names across the abstract base and derived class (parse/reset/destructor), and the fixture namespace is preserved in method names",
+        "The shared packet/state structure is recovered with semantic high-confidence field names (data/length/cursor-offset/valid) rather than generic offset names",
+        "Runtime/library/import functions are preserved or canonicalized with evidence rather than left default-named or semantically renamed"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Fully annotate the supplied stripped C fixture with AETHER Ghidra. Examine every function, distinguish application code from compiler/runtime/library code, use conservative C naming, recover the shared state structures and only high-confidence semantic fields, and track all work in PROGRESS.md so the run can resume after interruption. Save PROGRESS.md and verification.json to the output directory.",
+      "expected_output": "Exhaustive C annotation with safe symbol preservation, evidence-backed function names/comments, recovered shared structures, and no unaccounted functions.",
+      "files": [
+        "evals/files/c_struct_fixture"
+      ],
+      "expectations": [
+        "PROGRESS.md exists with complete coverage counts and a disposition row for every discovered function",
+        "verification.json is valid JSON listing final names and the recovered structure",
+        "Application functions receive conservative snake_case C names derived from evidence (init/consume/close pattern) with confidence comments",
+        "A shared connection/state structure is recovered with high-confidence semantic fields including an 8-byte counter field and a 32-byte name buffer",
+        "Compiler/runtime/import/thunk functions are preserved or canonicalized rather than semantically renamed"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Perform whole-binary annotation on the supplied Go executable using AETHER Ghidra. Preserve all identified Go package, method, runtime, wrapper, and ABI symbols; improve understanding with confidence-labeled function comments rather than renaming those symbols. Review every function and recover only strongly evidenced structures/fields. Maintain PROGRESS.md and save it with verification.json in the output directory.",
+      "expected_output": "Complete Go-aware coverage that does not rename reliable Go symbols, adds evidence-based confidence comments, preserves runtime functions, and records all progress and structure decisions.",
+      "files": [
+        "evals/files/go_symbol_fixture"
+      ],
+      "expectations": [
+        "PROGRESS.md exists and accounts for every discovered function including unnamed FUN_ functions with counts and dispositions",
+        "verification.json is valid JSON",
+        "Zero renames applied to identified Go package, method, runtime, wrapper, or ABI symbols",
+        "Confidence-labeled comments in [Confidence: ...] format with Purpose/Evidence are applied instead of renaming Go symbols",
+        "Only strongly evidenced structures are created, with any low-evidence fields left generic and explicitly tracked"
+      ]
+    }
+  ]
+}

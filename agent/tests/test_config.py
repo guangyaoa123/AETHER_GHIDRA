@@ -10,7 +10,7 @@ from aether_ghidra.config.settings import load_config, save_config
 
 
 class ConfigTests(unittest.TestCase):
-    def test_persisted_gui_values_override_environment_values(self) -> None:
+    def test_persisted_values_override_environment_values(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
             path.write_text(json.dumps({"OPENAI_API_KEY": "saved-key", "OPENAI_MODEL": "saved-model"}))
@@ -23,8 +23,6 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(config["OPENAI_API_KEY"], "saved-key")
         self.assertEqual(config["OPENAI_MODEL"], "saved-model")
-
-    def test_saved_empty_value_also_blocks_environment_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
             with patch("aether_ghidra.config.settings.CONFIG_PATH", path), patch.dict(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 import threading
 import unittest
@@ -72,6 +73,93 @@ class IndexingTests(unittest.TestCase):
         self.assertEqual(len(outcome), 1)
         self.assertIsInstance(outcome[0], IndexCancelled)
 
+    def test_provider_timeout_uses_configured_seconds(self) -> None:
+        captured: list[dict] = []
+        fake_httpx = SimpleNamespace(Client=lambda **kwargs: captured.append(kwargs) or SimpleNamespace())
+        fake_openai = SimpleNamespace(OpenAI=lambda **kwargs: SimpleNamespace())
+        indexer = FunctionIndexer("program", object(), cancel=threading.Event())
+        base_config = {key: value for key, value in indexer.config.items() if key != "INDEXING_TIMEOUT_SEC"}
+        cases = [
+            (base_config, 1800.0),
+            ({**base_config, "INDEXING_TIMEOUT_SEC": 3600}, 3600.0),
+            ({**base_config, "INDEXING_TIMEOUT_SEC": 0}, 1.0),
+        ]
+        for config, expected in cases:
+            with self.subTest(expected=expected):
+                indexer.config = config
+                with patch.dict(sys.modules, {"httpx": fake_httpx, "openai": fake_openai}):
+                    indexer._client()
+                self.assertEqual(captured[-1]["timeout"], expected)
+
+    def test_provider_request_retries_rate_limit_and_connection_errors(self) -> None:
+        import httpx
+        from openai import APIConnectionError, RateLimitError
+
+        provider_request_stub = httpx.Request("POST", "http://provider/v1/chat/completions")
+        outcomes: list[BaseException | str] = [
+            RateLimitError("rate limited", response=httpx.Response(429, request=provider_request_stub), body=None),
+            APIConnectionError(request=provider_request_stub),
+            "ok",
+        ]
+        calls: list[int] = []
+        sleeps: list[float] = []
+
+        def provider_request():
+            calls.append(1)
+            outcome = outcomes[len(calls) - 1]
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+        indexer = FunctionIndexer("program", object(), cancel=threading.Event())
+        with patch.object(indexer, "_sleep_cancellable", side_effect=sleeps.append):
+            self.assertEqual(indexer._cancellable_request(provider_request), "ok")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sleeps, [2.0, 4.0])
+
+    def test_provider_request_does_not_retry_fatal_errors(self) -> None:
+        import httpx
+        from openai import AuthenticationError
+
+        error = AuthenticationError(
+            "invalid key",
+            response=httpx.Response(401, request=httpx.Request("POST", "http://provider/v1/chat/completions")),
+            body=None,
+        )
+        calls: list[int] = []
+
+        def provider_request():
+            calls.append(1)
+            raise error
+
+        indexer = FunctionIndexer("program", object(), cancel=threading.Event())
+        with self.assertRaises(AuthenticationError):
+            indexer._cancellable_request(provider_request)
+        self.assertEqual(len(calls), 1)
+
+    def test_provider_request_stops_after_retry_budget(self) -> None:
+        import httpx
+        from openai import RateLimitError
+
+        calls: list[int] = []
+        sleeps: list[float] = []
+
+        def provider_request():
+            calls.append(1)
+            raise RateLimitError(
+                "rate limited",
+                response=httpx.Response(429, request=httpx.Request("POST", "http://provider/v1/chat/completions")),
+                body=None,
+            )
+
+        indexer = FunctionIndexer("program", object(), cancel=threading.Event())
+        indexer.config = {**indexer.config, "INDEXING_REQUEST_RETRIES": 2}
+        with patch.object(indexer, "_sleep_cancellable", side_effect=sleeps.append):
+            with self.assertRaises(RateLimitError):
+                indexer._cancellable_request(provider_request)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(sleeps), 2)
+
     def test_address_aliases_normalize_common_llm_forms(self) -> None:
         aliases = address_aliases({"space": "ram", "offset": "00101230"})
         self.assertIn("ram:00101230", aliases)
@@ -105,6 +193,69 @@ class IndexingTests(unittest.TestCase):
         with patch.object(indexer, "_client", return_value=client):
             self.assertEqual(indexer._classify(batch, {"ram:101230": "void entry() {}"}, index, DynamicTagManager()), [])
         self.assertEqual(index.llm_failed_entries["ram:101230"]["reason"], "empty_tool_response")
+
+    def test_empty_classifier_response_logs_diagnostics(self) -> None:
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(tool_calls=[], content="I will classify the functions now"),
+                finish_reason="length",
+            )],
+            usage=SimpleNamespace(completion_tokens=4096),
+        )
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **_: response)))
+        indexer = FunctionIndexer("program", object(), cancel=threading.Event())
+        batch = [{"name": "entry", "address": {"space": "ram", "offset": "101230"}, "called_functions": [], "caller_functions": []}]
+        with patch.object(indexer, "_client", return_value=client):
+            with self.assertLogs("aether_ghidra.features.indexing.indexer", level="WARNING") as captured:
+                indexer._classify(batch, {"ram:101230": "void entry() {}"}, FunctionIndex(), DynamicTagManager())
+        joined = "\n".join(captured.output)
+        self.assertIn("finish_reason=length", joined)
+        self.assertIn("completion_tokens=4096", joined)
+        self.assertIn("I will classify the functions now", joined)
+
+    def test_empty_batch_is_retried_instead_of_failing_job(self) -> None:
+        responses = [
+            SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(tool_calls=[]))]),
+            SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(tool_calls=[
+                SimpleNamespace(function=SimpleNamespace(arguments=json.dumps({
+                    "function_ref": {"name": "entry", "address": {"space": "ram", "offset": "1000"}},
+                    "importance": "HIGH", "categories": ["network"], "summary": "Sends network traffic",
+                }))),
+            ]))]),
+        ]
+        calls: list[dict] = []
+
+        def create(**kwargs):
+            calls.append(kwargs)
+            return responses[len(calls) - 1]
+
+        class Bridge:
+            def get_program_metadata(self):
+                return {"sha256": "empty-batch-retry", "name": "fixture", "function_count": 1}
+
+            def list_functions(self, **_kwargs):
+                return {"functions": [{
+                    "name": "entry", "address": {"space": "ram", "offset": "1000"},
+                    "size": 8, "library": False, "thunk": False,
+                }]}
+
+            def get_function(self, _ref, **_kwargs):
+                return {"code": "void entry() {}"}
+
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "index.json"
+            with patch.object(FunctionIndexManager, "path", return_value=path):
+                FunctionIndexManager._cache.clear()
+                indexer = FunctionIndexer("program", Bridge(), cancel=threading.Event())
+                with patch.object(indexer, "_client", return_value=client):
+                    result = indexer.run()
+
+        self.assertEqual(result.indexing_state, "COMPLETED")
+        self.assertEqual(result.entries_by_address["ram:1000"].summary, "Sends network traffic")
+        self.assertEqual(result.llm_failed_entries, {})
+        self.assertIsNone(result.batch_metadata.last_error)
+        self.assertEqual(len(calls), 2)
 
     def test_classifier_does_not_fall_back_to_function_name(self) -> None:
         response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(tool_calls=[

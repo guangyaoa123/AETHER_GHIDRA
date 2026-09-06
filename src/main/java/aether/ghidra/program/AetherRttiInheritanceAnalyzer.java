@@ -582,7 +582,7 @@ public final class AetherRttiInheritanceAnalyzer extends AbstractAnalyzer {
 						continue;
 					}
 					for (Map<String, Object> parentVtable : mapList(parent.get("vtables"))) {
-						linkSlots(childVtable, parentVtable, parentId, parentName, monitor);
+						linkSlots(child, childVtable, parent, parentVtable, parentId, parentName, monitor);
 					}
 				}
 			}
@@ -625,8 +625,9 @@ public final class AetherRttiInheritanceAnalyzer extends AbstractAnalyzer {
 		return result;
 	}
 
-	private static void linkSlots(Map<String, Object> childVtable, Map<String, Object> parentVtable,
-		String parentId, String parentName, TaskMonitor monitor) throws CancelledException {
+	private static void linkSlots(Map<String, Object> child, Map<String, Object> childVtable,
+		Map<String, Object> parent, Map<String, Object> parentVtable, String parentId,
+		String parentName, TaskMonitor monitor) throws CancelledException {
 		Map<Integer, Map<String, Object>> parentSlots = new HashMap<>();
 		for (Map<String, Object> parentSlot : mapList(parentVtable.get("slots"))) {
 			Object index = parentSlot.get("index");
@@ -658,6 +659,17 @@ public final class AetherRttiInheritanceAnalyzer extends AbstractAnalyzer {
 			List<Map<String, Object>> relations = (List<Map<String, Object>>) childSlot.computeIfAbsent(
 				"parent_relations", ignored -> new ArrayList<Map<String, Object>>());
 			relations.add(relation);
+			Map<String, Object> reverse = new LinkedHashMap<>();
+			reverse.put("child_class_id", modelId(child));
+			reverse.put("child_class", child.get("name"));
+			reverse.put("child_vtable", childVtable.get("address"));
+			reverse.put("child_slot", childSlot.get("index"));
+			reverse.put("function", childSlot.get("function"));
+			reverse.put("relation", relationKind);
+			@SuppressWarnings("unchecked")
+			List<Map<String, Object>> reverseRelations = (List<Map<String, Object>>) parentSlot.computeIfAbsent(
+				"child_relations", ignored -> new ArrayList<Map<String, Object>>());
+			reverseRelations.add(reverse);
 			if (!childSlot.containsKey("relation") || "override".equals(relationKind)) {
 				childSlot.put("relation", relationKind);
 			}
